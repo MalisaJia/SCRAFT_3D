@@ -1,0 +1,27 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- IDE ----
+.idea/
+
+# ---- Model weights / large binaries ----
+*.pt
+*.pth
+*.safetensors
+*.obj
+*.png
+nohup.out
+
+# ---- Run artifacts / downloads / caches ----
+outputs/
+results_v2/
+results_img_chair/
+*.log
+cache/
+weights/
+_tmp-test/
+
+# ---- One-off SSH helper scripts (contain server connection details, never commit) ----
+_ssh_*.py

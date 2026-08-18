@@ -1,0 +1,1095 @@
+"""TripoSG LoRA fine-tuning on precomputed Objaverse latents.
+
+Usage:
+    python train_diffusion.py --config configs/train_diffusion.yaml [--resume checkpoint.pt]
+
+单网络扩散训练管线（与 GAN 的 ``train.py`` 完全独立，不共享任何训练状态）：
+1. 加载冻结的 TripoSG DiT（``TripoSGDiTModel``，diffusers 目录布局权重），
+   对注意力 ``to_q`` / ``to_v`` 投影注入 LoRA 适配器（仅训练 LoRA 参数）
+2. Rectified flow 目标：``x_t = (1-t)*x_0 + t*noise``，预测速度 ``v = noise - x_0``，
+   MSE 损失；时间步按真实调度器约定缩放至 [0, 1000]（``training.timestep_scale``）
+3. 数据来自 ``scripts/precompute_latents.py`` 预计算的 VAE latent shard
+   （latent 形状 [2048, 64]），训练循环内不做任何渲染 / VAE 编解码
+   （纯张量运算，速度最大化）；shard 中若含 DINOv2 ``image_embeds`` 则作为
+   cross-attention 条件，缺失时按无条件（零嵌入，与官方 CFG 空分支一致）训练
+4. 训练特性：bf16 autocast、梯度检查点、LoRA 权重 EMA、cosine LR + warmup
+5. 定期评估：用 EMA 权重 Euler 采样 latent -> VAE 解码 SDF ->
+   ``triposg.inference_utils.hierarchical_extract_geometry`` 八叉树提取
+   -> ``MultiViewRenderer`` 渲染预览图（评估失败不影响训练）
+6. 日志：TensorBoard（loss / LR / grad_norm / 评估渲染图）+ 文本日志，
+   风格与 ``train.py`` 保持一致
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import yaml
+from torch import Tensor
+from torch.utils.data import DataLoader, Dataset
+
+# TensorBoard 为可选依赖：缺失时训练照常进行，只是不写标量日志
+try:
+    from torch.utils.tensorboard import SummaryWriter
+
+    HAS_TENSORBOARD = True
+except ImportError:  # pragma: no cover - 取决于运行环境是否安装 tensorboard
+    HAS_TENSORBOARD = False
+
+# 允许从任意工作目录运行本脚本（把项目根目录加入 import 路径）
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+LOGGER = logging.getLogger("diffusion_train")
+
+# 梯度裁剪阈值（LoRA 微调通常较稳定，1.0 足以防御偶发尖峰）
+GRAD_CLIP = 1.0
+
+# 评估时 Euler 采样的步数（预览用途，不必追求高质量）
+EVAL_NUM_STEPS = 25
+
+# 评估时 VAE 解码 SDF 的八叉树深度（res = 2^depth；7 -> 128，低分辨率换速度）
+EVAL_OCTREE_DEPTH = 7
+
+# 真实 DiT 的 cross-attention 条件维度（DINOv2 large = 1024）
+DIT_COND_DIM = 1024
+
+# DINOv2 图像条件的 token 数：pipeline 的 feature_extractor 把图 resize 到
+# 518×518，patch_size=14 -> (518/14)^2 = 1369 patches + 1 CLS = 1370
+# （官方 CFG 空分支为 torch.zeros_like(image_embeds)，形状同 [B, 1370, 1024]）
+DIT_COND_NUM_TOKENS = 1370
+
+# 每次评估渲染的样本数
+EVAL_NUM_SAMPLES = 4
+
+
+# ====================================================================== #
+# 配置
+# ====================================================================== #
+def load_config(path: str) -> Dict[str, Any]:
+    """加载 YAML 训练配置（缺失的顶层 block 补成空 dict）。"""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"配置文件不存在: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+    for block in ("model", "training", "data", "logging"):
+        config.setdefault(block, {})
+    return config
+
+
+def setup_logging(output_dir: str) -> None:
+    """同时输出到控制台和 ``<output_dir>/train.log``（与 train.py 一致）。"""
+    os.makedirs(output_dir, exist_ok=True)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.handlers.clear()
+
+    formatter = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(formatter)
+    LOGGER.addHandler(stream)
+
+    file_handler = logging.FileHandler(
+        os.path.join(output_dir, "train.log"), encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    LOGGER.addHandler(file_handler)
+
+
+def set_seed(seed: int) -> None:
+    """固定随机种子（不启用 deterministic，以免明显变慢）。"""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ====================================================================== #
+# LoRA 适配器
+# ====================================================================== #
+class LoRALinear(nn.Module):
+    """低秩适配的 Linear：``y = W x + scale * B A x``。
+
+    原始权重全程冻结（requires_grad=False），只训练低秩分支 A / B；
+    B 初始化为零，保证注入瞬间模型行为与预训练完全一致。
+    """
+
+    def __init__(self, base: nn.Linear, rank: int, alpha: float) -> None:
+        super().__init__()
+        self.base = base
+        self.rank = rank
+        self.scaling = alpha / float(rank)
+
+        in_features = base.in_features
+        out_features = base.out_features
+        # 与主干层同设备 / 同 dtype 分配，避免 DiT 在 CUDA 上时设备不匹配崩溃
+        self.lora_A = nn.Parameter(
+            torch.empty(rank, in_features, device=base.weight.device, dtype=base.weight.dtype)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(out_features, rank, device=base.weight.device, dtype=base.weight.dtype)
+        )
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+        # 冻结主干权重，优化器只收集 LoRA 参数
+        for param in self.base.parameters():
+            param.requires_grad_(False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        base_out = self.base(x)
+        lora_out = F.linear(F.linear(x, self.lora_A), self.lora_B)
+        return base_out + lora_out * self.scaling
+
+
+# 目标模块名的常见别名：真实 TripoSG DiT 用 diffusers ``Attention``，
+# 投影层命名为 ``to_q`` / ``to_k`` / ``to_v`` / ``to_out``；保留旧别名兼容
+_TARGET_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "q_proj": ("to_q", "q_proj", "query"),
+    "v_proj": ("to_v", "v_proj", "value"),
+    "k_proj": ("to_k", "k_proj", "key"),
+    "o_proj": ("to_out", "o_proj", "proj"),
+    "to_q": ("to_q",),
+    "to_v": ("to_v",),
+    "to_k": ("to_k",),
+}
+
+
+def _match_target(leaf_name: str, targets: List[str]) -> bool:
+    """判断模块叶子名是否命中任一目标（含别名展开）。"""
+    expanded: List[str] = []
+    for target in targets:
+        expanded.extend(_TARGET_ALIASES.get(target, (target,)))
+    return any(alias == leaf_name or alias in leaf_name for alias in expanded)
+
+
+def inject_lora(
+    dit: nn.Module, rank: int, target_modules: List[str], alpha: Optional[float] = None
+) -> Dict[str, LoRALinear]:
+    """给 DiT 的注意力投影注入 LoRA 适配器（原地替换 Linear 模块）。
+
+    真实 TripoSG DiT（``TripoSGDiTModel``）的自注意力 / 交叉注意力投影位于
+    ``blocks.{i}.attn1.{to_q,to_v}`` 与 ``blocks.{i}.attn2.{to_q,to_v}``
+    （diffusers ``Attention`` 模块），目标名推荐直接写 ``["to_q", "to_v"]``。
+
+    Args:
+        dit: 冻结的 TripoSG DiT。
+        rank: LoRA 秩。
+        target_modules: 目标模块名列表（如 ["to_q", "to_v"]）。
+        alpha: LoRA 缩放系数，默认取 rank（scaling=1）。
+
+    Returns:
+        注入后的 ``{完整模块名: LoRALinear}`` 字典；为空说明未命中任何层。
+    """
+    alpha = float(alpha if alpha is not None else rank)
+    injected: Dict[str, LoRALinear] = {}
+
+    for name, module in list(dit.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        leaf = name.rsplit(".", 1)[-1] if "." in name else name
+        if not _match_target(leaf, target_modules):
+            continue
+        # 找到父模块并原地替换属性
+        parent = dit
+        if "." in name:
+            parent_name = name.rsplit(".", 1)[0]
+            parent = dit.get_submodule(parent_name)
+        adapter = LoRALinear(module, rank, alpha)
+        setattr(parent, leaf, adapter)
+        injected[name] = adapter
+
+    if not injected:
+        raise RuntimeError(
+            f"未在 DiT 中找到任何匹配 {target_modules} 的 Linear 层，"
+            "请检查 model.diffusion.lora_target_modules 配置"
+        )
+    return injected
+
+
+def lora_state_dict(adapters: Dict[str, LoRALinear]) -> Dict[str, Tensor]:
+    """只提取 LoRA 分支的权重（A / B），checkpoint 体积与秩成正比。"""
+    state: Dict[str, Tensor] = {}
+    for name, adapter in adapters.items():
+        state[f"{name}.lora_A"] = adapter.lora_A.detach().clone()
+        state[f"{name}.lora_B"] = adapter.lora_B.detach().clone()
+    return state
+
+
+def load_lora_state_dict(adapters: Dict[str, LoRALinear], state: Dict[str, Tensor]) -> None:
+    """把 checkpoint 中的 LoRA 权重写回适配器。"""
+    for name, adapter in adapters.items():
+        key_a, key_b = f"{name}.lora_A", f"{name}.lora_B"
+        if key_a not in state or key_b not in state:
+            raise KeyError(f"checkpoint 缺少 LoRA 权重: {key_a} / {key_b}")
+        adapter.lora_A.data.copy_(state[key_a].to(adapter.lora_A.device))
+        adapter.lora_B.data.copy_(state[key_b].to(adapter.lora_B.device))
+
+
+# ====================================================================== #
+# TripoSG 加载（懒加载，与 diffusion_adapter.py 同一模式）
+# ====================================================================== #
+def _resolve_weights_dir(weights_path: str) -> Optional[Path]:
+    """解析 weights_path：文件 -> 其所在目录；目录 -> 本身；不存在 -> None。"""
+    if not weights_path:
+        return None
+    path = Path(weights_path)
+    if path.is_file():
+        return path.parent
+    if path.is_dir():
+        return path
+    return None
+
+
+def build_dit_with_lora(
+    config: Dict[str, Any], device: torch.device
+) -> Tuple[nn.Module, Dict[str, LoRALinear], Optional[Any]]:
+    """加载冻结的 TripoSG DiT（``TripoSGDiTModel``），注入 LoRA 适配器。
+
+    权重为 diffusers 目录布局（``model_index.json`` + ``transformer/`` +
+    ``vae/`` 等子目录），通过 ``from_pretrained(..., subfolder=...)`` 装配；
+    本地目录缺少 ``model_index.json`` 时回退 HuggingFace ``VAST-AI/TripoSG``。
+
+    Args:
+        config: 完整训练配置（读取 ``model.diffusion`` 段）。
+        device: 模型设备。
+
+    Returns:
+        (dit, lora_adapters, vae_or_none)：DiT（主干冻结）、LoRA 适配器字典、
+        VAE 实例（加载成功时返回，供评估解码使用；否则为 None）。
+
+    Raises:
+        RuntimeError: TripoSG 未安装或权重加载失败。
+    """
+    diffusion_cfg = (config.get("model", {}) or {}).get("diffusion", {})
+    weights_path = str(diffusion_cfg.get("weights_path", "") or "")
+    rank = int(diffusion_cfg.get("lora_rank", 16))
+    targets = list(diffusion_cfg.get("lora_target_modules", ["to_q", "to_v"]))
+
+    try:
+        from triposg.models.autoencoders import TripoSGVAEModel
+        from triposg.models.transformers import TripoSGDiTModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "未能导入 TripoSG（triposg.models）。"
+            "请先克隆 TripoSG 仓库并安装其依赖，或检查 PYTHONPATH。"
+        ) from exc
+
+    dit = None
+    vae = None
+    weights_dir = _resolve_weights_dir(weights_path)
+    if weights_dir is not None and (weights_dir / "model_index.json").is_file():
+        try:
+            dit = TripoSGDiTModel.from_pretrained(str(weights_dir), subfolder="transformer")
+        except Exception as exc:
+            LOGGER.warning("本地 DiT 加载失败（%s），回退 HuggingFace", exc)
+        vae_dir = weights_dir / "vae"
+        if (vae_dir / "config.json").is_file():
+            try:
+                vae = TripoSGVAEModel.from_pretrained(str(weights_dir), subfolder="vae")
+            except Exception as exc:  # 评估解码非必需，失败只警告不阻断
+                LOGGER.warning("本地 VAE 加载失败（%s），评估阶段将跳过 mesh 解码", exc)
+                vae = None
+        else:
+            LOGGER.warning("未找到 VAE 权重目录 %s，评估阶段将跳过 mesh 解码", vae_dir)
+
+    if dit is None:
+        # 本地权重不可用时回退 HuggingFace 官方仓库（VAST-AI/TripoSG）
+        from triposg.pipelines import TripoSGPipeline
+
+        LOGGER.info("从 HuggingFace VAST-AI/TripoSG 加载权重...")
+        pipeline = TripoSGPipeline.from_pretrained("VAST-AI/TripoSG")
+        dit = pipeline.transformer
+        if vae is None:
+            vae = pipeline.vae
+
+    dit = dit.to(device)
+    if vae is not None:
+        vae = vae.to(device)
+        vae.eval()
+        for param in vae.parameters():
+            param.requires_grad_(False)
+
+    # ---- 冻结主干 ----
+    dit.eval()
+    for param in dit.parameters():
+        param.requires_grad_(False)
+
+    # ---- 注入 LoRA（注入后切回 train 模式，仅 LoRA 分支参与训练）----
+    adapters = inject_lora(dit, rank, targets)
+    dit.train()
+    num_lora_params = sum(
+        adapter.lora_A.numel() + adapter.lora_B.numel()
+        for adapter in adapters.values()
+    )
+    LOGGER.info(
+        "LoRA 注入完成：%d 个注意力投影层，rank=%d，可训练参数 %.2fM",
+        len(adapters),
+        rank,
+        num_lora_params / 1e6,
+    )
+    return dit, adapters, vae
+
+
+# ====================================================================== #
+# DiT 前向（真实签名：hidden_states / timestep / encoder_hidden_states）
+# ====================================================================== #
+def forward_dit(dit: nn.Module, x_t: Tensor, t: Tensor, cond: Optional[Tensor] = None) -> Tensor:
+    """调用 TripoSG DiT 预测速度场。
+
+    真实 ``TripoSGDiTModel.forward`` 签名::
+
+        forward(hidden_states, timestep, encoder_hidden_states=None, ...)
+        -> Transformer1DModelOutput(sample=[B, N, 64])
+
+    Args:
+        dit: TripoSG DiT（含 LoRA 适配器）。
+        x_t: 加噪 latent，[B, N, 64]。
+        t: 时间步，[B]（按调度器约定缩放到 [0, 1000]）。
+        cond: DINOv2 图像条件嵌入 [B, S, 1024]；None 表示无条件（与官方
+            CFG 的零嵌入空分支等价，DiT 内部对 None 同样处理）。
+
+    Returns:
+        速度预测 [B, N, 64]（与 x_t 同形状）。
+    """
+    output = dit(
+        hidden_states=x_t,
+        timestep=t,
+        encoder_hidden_states=cond,
+        return_dict=False,
+    )
+    return output[0]
+
+
+# ====================================================================== #
+# 梯度检查点
+# ====================================================================== #
+def enable_gradient_checkpointing(dit: nn.Module) -> int:
+    """对 DiT 中的 transformer block 序列启用梯度检查点。
+
+    扫描所有长度 >= 2 的 ``nn.ModuleList``（典型的 blocks / layers 容器），
+    把每个 block 的 forward 包装为 ``torch.utils.checkpoint.checkpoint``。
+
+    Returns:
+        被包装的 block 数量（0 表示未找到可包装的序列）。
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    wrapped = 0
+    for module in dit.modules():
+        if not isinstance(module, nn.ModuleList) or len(module) < 2:
+            continue
+        for i, block in enumerate(module):
+            if not isinstance(block, nn.Module):
+                continue
+            original_forward = block.forward
+
+            def checkpointed(*args: Any, _fwd: Any = original_forward, **kwargs: Any) -> Tensor:
+                return checkpoint(_fwd, *args, use_reentrant=False, **kwargs)
+
+            block.forward = checkpointed  # type: ignore[method-assign]
+            wrapped += 1
+    return wrapped
+
+
+# ====================================================================== #
+# Latent 缓存数据集
+# ====================================================================== #
+class LatentCacheDataset(Dataset):
+    """读取 ``scripts/precompute_latents.py`` 输出的 latent shard 数据集。
+
+    shard 文件为 ``latent_shard_{i}.pt``，内含 ``{'latents', 'captions', 'uids'}``；
+    ``manifest.json`` 记录各 shard 的样本数。shard 张量按需加载并缓存在进程内
+    （多 worker 下每个 worker 独立缓存各自访问过的 shard）。
+
+    可选传入 ``critic_weights_path``（Learned Semantic Reward 阶段二的
+    ``critic_weights.json``，``{uid: weight}``）：每个样本附带其训练权重，
+    缺失 uid 一律按 1.0 处理，不改变其他训练逻辑。
+    """
+
+    def __init__(self, cache_dir: str, critic_weights_path: Optional[str] = None) -> None:
+        self.cache_dir = cache_dir
+
+        # Learned Semantic Reward 训练加权：uid -> 权重（缺失样本回落 1.0）
+        self.critic_weights: Dict[str, float] = {}
+        if critic_weights_path:
+            if not os.path.isfile(critic_weights_path):
+                raise FileNotFoundError(
+                    f"critic 权重文件不存在: {critic_weights_path}，"
+                    f"请先运行 scripts/score_latents_critic.py"
+                )
+            with open(critic_weights_path, "r", encoding="utf-8") as handle:
+                self.critic_weights = {
+                    str(uid): float(weight)
+                    for uid, weight in json.load(handle).items()
+                }
+        manifest_path = os.path.join(cache_dir, "manifest.json")
+        if not os.path.isfile(manifest_path):
+            raise FileNotFoundError(
+                f"找不到 {manifest_path}，请先运行 scripts/precompute_latents.py"
+            )
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            self.manifest = json.load(handle)
+
+        # 展平索引：sample_index -> (shard 文件名, shard 内下标)
+        self.index: List[Tuple[str, int]] = []
+        for shard_info in self.manifest.get("shards", []):
+            shard_path = os.path.join(cache_dir, shard_info["path"])
+            if not os.path.isfile(shard_path):
+                LOGGER.warning("manifest 中的 shard 不存在，跳过: %s", shard_path)
+                continue
+            n = int(shard_info.get("num_samples", 0))
+            self.index.extend((shard_info["path"], i) for i in range(n))
+
+        if not self.index:
+            raise RuntimeError(f"latent 缓存为空: {cache_dir}")
+        self._shard_cache: Dict[str, Dict[str, Any]] = {}
+
+        # 探测首个 shard 的 image_embeds 序列长度（缺失时用默认值造零嵌入）
+        first_shard = self._get_shard(self.index[0][0])
+        embeds = first_shard.get("image_embeds", None)
+        if embeds is not None:
+            self.cond_num_tokens = int(embeds.shape[1])
+            self.cond_dim = int(embeds.shape[2])
+        else:
+            self.cond_num_tokens = DIT_COND_NUM_TOKENS
+            self.cond_dim = DIT_COND_DIM
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def _get_shard(self, shard_name: str) -> Dict[str, Any]:
+        """加载（或从进程内缓存取）shard 张量。"""
+        if shard_name not in self._shard_cache:
+            self._shard_cache[shard_name] = torch.load(
+                os.path.join(self.cache_dir, shard_name), map_location="cpu"
+            )
+        return self._shard_cache[shard_name]
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        shard_name, inner_idx = self.index[idx]
+        shard = self._get_shard(shard_name)
+        latent = shard["latents"][inner_idx].float()  # fp16 -> fp32
+        captions = shard.get("captions", [])
+        caption = captions[inner_idx] if inner_idx < len(captions) else ""
+        uids = shard.get("uids", [])
+        uid = str(uids[inner_idx]) if inner_idx < len(uids) else f"{shard_name}:{inner_idx}"
+        # Learned Semantic Reward 训练加权：缺失 uid 按 1.0（不改变原始损失）
+        weight = float(self.critic_weights.get(uid, 1.0)) if self.critic_weights else 1.0
+        # DINOv2 图像条件嵌入（可选）：缺失时填零（与官方 CFG 空分支一致）
+        image_embeds = shard.get("image_embeds", None)
+        if image_embeds is not None:
+            image_embeds = image_embeds[inner_idx].float()
+        else:
+            image_embeds = torch.zeros(
+                (self.cond_num_tokens, self.cond_dim), dtype=torch.float32
+            )
+        return {
+            "latent": latent,
+            "caption": caption,
+            "image_embeds": image_embeds,
+            "uid": uid,
+            "weight": torch.tensor(weight, dtype=torch.float32),
+        }
+
+
+def build_dataloader(config: Dict[str, Any], dataset: LatentCacheDataset) -> DataLoader:
+    """构建 latent 训练 dataloader（固定形状张量，直接默认 collate）。"""
+    train_cfg = config.get("training", {})
+    data_cfg = config.get("data", {})
+    return DataLoader(
+        dataset,
+        batch_size=int(train_cfg.get("batch_size", 32)),
+        shuffle=True,
+        num_workers=int(data_cfg.get("num_workers", 4)),
+        drop_last=True,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def infinite_batches(loader: DataLoader) -> Iterator[Dict[str, Any]]:
+    """无限循环迭代 dataloader（每个 epoch 自动重新洗牌）。"""
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def _dataset_uid_weighted(
+    dataset: LatentCacheDataset, shard_name: str, inner_idx: int
+) -> bool:
+    """判断某条样本的 uid 是否在 Critic 权重表内（启动期覆盖率统计用）。"""
+    shard = dataset._get_shard(shard_name)
+    uids = shard.get("uids", [])
+    uid = str(uids[inner_idx]) if inner_idx < len(uids) else f"{shard_name}:{inner_idx}"
+    return uid in dataset.critic_weights
+
+
+# ====================================================================== #
+# LR 调度器（cosine + warmup）
+# ====================================================================== #
+def build_scheduler(
+    optimizer: torch.optim.Optimizer, warmup_steps: int, max_iterations: int
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """线性 warmup 后 cosine 衰减到 0。"""
+    warmup_steps = max(1, int(warmup_steps))
+    max_iterations = max(warmup_steps + 1, int(max_iterations))
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        progress = (step - warmup_steps) / float(max_iterations - warmup_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+# ====================================================================== #
+# EMA（仅针对 LoRA 权重）
+# ====================================================================== #
+class LoRAEMA:
+    """LoRA 权重的指数滑动平均（评估 / 导出用）。"""
+
+    def __init__(self, adapters: Dict[str, LoRALinear], decay: float) -> None:
+        self.decay = float(decay)
+        self.shadow = lora_state_dict(adapters)
+
+    @torch.no_grad()
+    def update(self, adapters: Dict[str, LoRALinear]) -> None:
+        state = lora_state_dict(adapters)
+        for key, value in self.shadow.items():
+            value.mul_(self.decay).add_(state[key].to(value.device), alpha=1.0 - self.decay)
+
+    def apply(self, adapters: Dict[str, LoRALinear]) -> Dict[str, Tensor]:
+        """把 EMA 权重临时写入适配器，返回原权重用于之后恢复。"""
+        backup = lora_state_dict(adapters)
+        load_lora_state_dict(adapters, self.shadow)
+        return backup
+
+    @staticmethod
+    def restore(adapters: Dict[str, LoRALinear], backup: Dict[str, Tensor]) -> None:
+        """恢复 ``apply`` 前的原始权重。"""
+        load_lora_state_dict(adapters, backup)
+
+
+# ====================================================================== #
+# 训练步：rectified flow
+# ====================================================================== #
+def train_step(
+    dit: nn.Module,
+    latents: Tensor,
+    use_bf16: bool,
+    timestep_scale: float = 1000.0,
+    cond: Optional[Tensor] = None,
+    sample_weights: Optional[Tensor] = None,
+) -> Tensor:
+    """单步扩散训练：采样 t -> 加噪 -> 预测速度 -> MSE。
+
+    Rectified flow 约定（t ∈ [0, 1]，与 ``RectifiedFlowScheduler`` 一致）::
+
+        x_t     = (1 - t) * x_0 + t * noise
+        目标速度 v = noise - x_0   （即 dx_t / dt）
+
+    Args:
+        dit: 含 LoRA 的 DiT。
+        latents: 干净 latent ``x_0``，[B, 2048, 64]。
+        use_bf16: 是否启用 bf16 autocast。
+        timestep_scale: 送入 DiT 的时间步缩放（真实调度器期望 [0, 1000]）。
+        cond: DINOv2 图像条件嵌入 [B, S, 1024]；None 为无条件训练。
+        sample_weights: [B] 逐样本损失权重（Learned Semantic Reward 训练加权）；
+            None / 全 1 时退化为普通均值 MSE。
+
+    Returns:
+        标量 MSE 损失。
+    """
+    device = latents.device
+    batch_size = latents.shape[0]
+
+    noise = torch.randn_like(latents)
+    t = torch.rand(batch_size, device=device, dtype=latents.dtype)  # U(0, 1)
+    t_expand = t.view(batch_size, *([1] * (latents.dim() - 1)))
+
+    x_t = (1.0 - t_expand) * latents + t_expand * noise
+    velocity_target = noise - latents
+
+    # 梯度检查点要求至少一个输入张量带梯度，x_t 作为锚点
+    x_t = x_t.detach().requires_grad_(torch.is_grad_enabled())
+
+    ctx = (
+        torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        if use_bf16 and device.type == "cuda"
+        else torch.autocast("cpu", enabled=False)
+    )
+    with ctx:
+        velocity_pred = forward_dit(dit, x_t, t * timestep_scale, cond)
+        if sample_weights is None:
+            loss = F.mse_loss(velocity_pred.float(), velocity_target.float())
+        else:
+            # 逐样本 MSE -> 按 Critic 权重加权平均（权重均值已归一到 1.0，
+            # 不改变损失的期望量级）
+            per_sample = F.mse_loss(
+                velocity_pred.float(), velocity_target.float(), reduction="none"
+            )
+            per_sample = per_sample.flatten(1).mean(dim=1)  # [B]
+            loss = (per_sample * sample_weights.to(per_sample)).mean()
+    return loss
+
+
+# ====================================================================== #
+# 评估：Euler 采样 -> VAE 解码 -> mesh -> 多视角渲染
+# ====================================================================== #
+@torch.no_grad()
+def sample_latent_euler(
+    dit: nn.Module,
+    latent_shape: Tuple[int, ...],
+    device: torch.device,
+    num_steps: int = EVAL_NUM_STEPS,
+    timestep_scale: float = 1000.0,
+    cond: Optional[Tensor] = None,
+) -> Tensor:
+    """用训练好的速度场从纯噪声做 Euler 反向积分，得到采样 latent。
+
+    积分方向 t: 1 -> 0（x_1 = noise，x_0 = 数据），步长 dt = -1/num_steps。
+    """
+    x = torch.randn((1, *latent_shape), device=device)
+    dt = 1.0 / float(num_steps)
+    for step in range(num_steps):
+        t = torch.full((1,), 1.0 - step * dt, device=device)
+        velocity = forward_dit(dit, x, t * timestep_scale, cond)
+        x = x - dt * velocity
+    return x.squeeze(0)
+
+
+def _make_sdf_func(vae: Any, latent: Tensor):
+    """构造 ``hierarchical_extract_geometry`` 需要的 SDF 查询函数。
+
+    真实 ``TripoSGVAEModel.decode(z, sampled_points)`` 返回
+    ``DecoderOutput(sample=SDF)``；包装成 points [1, N, 3] -> sdf [1, N, 1] 的可调用。
+
+    注意：``hierarchical_extract_geometry`` 传入的 points 已带 batch 维
+    （``xyz_samples.unsqueeze(0)``），这里绝不能再 unsqueeze，否则 4D 输入会触发
+    attention processor 的 ndim==4 分支导致形状错乱。
+    """
+    latent_batch = latent.unsqueeze(0)  # [1, N_tok, 64]
+
+    def sdf_func(points: Tensor) -> Tensor:
+        output = vae.decode(latent_batch, sampled_points=points)
+        return output.sample if hasattr(output, "sample") else output[0]
+
+    return sdf_func
+
+
+@torch.no_grad()
+def decode_latent_to_mesh(
+    vae: Any, latent: Tensor, octree_depth: int = EVAL_OCTREE_DEPTH
+) -> Tuple[Tensor, Tensor]:
+    """把 latent 解码为 SDF 并用分层八叉树提取归一化 mesh。
+
+    调用 ``triposg.inference_utils.hierarchical_extract_geometry``
+    （与 pipeline 的 mesh 提取路径完全一致）。
+
+    Returns:
+        (vertices [V, 3], faces [F, 3])，坐标在 [-1.005, 1.005]^3 域内。
+
+    Raises:
+        RuntimeError: 提取失败或结果为空。
+    """
+    from triposg.inference_utils import hierarchical_extract_geometry
+
+    device = latent.device
+    bounds = (-1.005,) * 3 + (1.005,) * 3
+    results = hierarchical_extract_geometry(
+        _make_sdf_func(vae, latent.to(device)),
+        device=device,
+        bounds=bounds,
+        dense_octree_depth=max(octree_depth - 2, 4),
+        hierarchical_octree_depth=octree_depth,
+    )
+    if not results:
+        raise RuntimeError("八叉树提取未得到任何 mesh")
+    verts, faces = results[0]
+    # marching_cubes 失败时 triposg 返回 (None, None)，必须先兜住再转数组，
+    # 否则 np.asarray(None) 抛 TypeError（不在打分侧常规捕获范围内）
+    if verts is None or faces is None:
+        raise RuntimeError("八叉树提取失败（marching cubes 返回空）")
+    verts = np.asarray(verts, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int64)
+    if verts.size == 0 or faces.size == 0:
+        raise RuntimeError("提取的 mesh 为空")
+
+    # 归一化到单位球 + 外向 CCW 环绕（与 diffusion_adapter 的后处理一致）
+    center = 0.5 * (verts.max(axis=0) + verts.min(axis=0))
+    verts = verts - center
+    radius = float(np.linalg.norm(verts, axis=1).max())
+    if radius < 1e-8:
+        raise RuntimeError("解码 mesh 退化")
+    verts = verts / radius
+
+    v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+    face_normals = np.cross(v1 - v0, v2 - v0)
+    centroids = (v0 + v1 + v2) / 3.0
+    outward = np.sum(face_normals * (centroids - verts.mean(axis=0, keepdims=True)), axis=1) > 0
+    fixed = faces.copy()
+    fixed[~outward] = faces[~outward][:, ::-1]
+
+    return (
+        torch.from_numpy(verts.astype(np.float32)),
+        torch.from_numpy(fixed.astype(np.int64)),
+    )
+
+
+@torch.no_grad()
+def run_evaluation(
+    iteration: int,
+    dit: nn.Module,
+    adapters: Dict[str, LoRALinear],
+    ema: LoRAEMA,
+    vae: Optional[Any],
+    dataset: LatentCacheDataset,
+    config: Dict[str, Any],
+    device: torch.device,
+    writer: Optional[Any],
+) -> None:
+    """定期评估：EMA 权重采样 latent -> 解码 mesh -> 渲染预览图。
+
+    评估失败只记警告，绝不中断训练。
+    """
+    output_dir = config.get("logging", {}).get("output_dir", "./outputs/diffusion_train")
+    eval_dir = os.path.join(output_dir, "eval")
+    train_cfg = config.get("training", {})
+    timestep_scale = float(train_cfg.get("timestep_scale", 1000.0))
+
+    try:
+        from rendering.multi_view_render import MultiViewRenderer
+        from utils.visualize import save_image, tile_images
+
+        renderer = MultiViewRenderer(num_views=4, azimuth_strategy="fixed", device=str(device))
+    except Exception as exc:  # 渲染器依赖 nvdiffrast/CUDA，不可用时跳过
+        LOGGER.warning("[评估] 渲染器构建失败（%s），跳过本次评估", exc)
+        return
+
+    # 用 EMA 权重评估（评估后恢复训练权重）
+    backup = ema.apply(adapters)
+    dit.eval()
+    try:
+        latent_shape = tuple(dataset.manifest.get("latent_shape") or ())
+        if not latent_shape:
+            shard = dataset._get_shard(dataset.index[0][0])
+            latent_shape = tuple(shard["latents"].shape[1:])
+
+        # 采样条件：零嵌入（与官方 CFG 空分支一致）。不能传 None ——
+        # diffusers Attention 在 encoder_hidden_states=None 时会拿 2048 维的
+        # hidden_states 当 cross-attn KV，撞上 to_k/to_v 的 1024 维投影报形状错
+        cond = torch.zeros(
+            (1, dataset.cond_num_tokens, dataset.cond_dim), device=device
+        )
+
+        if vae is None:
+            LOGGER.warning("[评估] VAE 不可用，跳过 mesh 解码预览")
+            return
+
+        tiles = []
+        for i in range(EVAL_NUM_SAMPLES):
+            try:
+                latent = sample_latent_euler(
+                    dit, latent_shape, device, EVAL_NUM_STEPS, timestep_scale, cond
+                )
+                vertices, faces = decode_latent_to_mesh(vae, latent)
+                out = renderer.render(vertices.unsqueeze(0).to(device), faces.to(device))
+                tiles.append(out["images"][0].cpu())  # [N_views, 3, H, W]
+            except Exception as exc:
+                LOGGER.warning("[评估] 样本 %d 生成失败（%s），跳过", i, exc)
+                continue
+
+        if tiles:
+            grid = tile_images(torch.cat(tiles, dim=0), ncols=8)
+            image_path = os.path.join(eval_dir, f"sample_{iteration:07d}.png")
+            save_image(grid, image_path)
+            LOGGER.info("[评估] 已保存 %d 个采样预览 -> %s", len(tiles), image_path)
+            if writer is not None:
+                grid_np = np.asarray(grid)
+                if grid_np.ndim == 2:
+                    grid_np = np.stack([grid_np] * 3, axis=-1)
+                writer.add_image("eval/samples", grid_np, iteration, dataformats="HWC")
+    finally:
+        LoRAEMA.restore(adapters, backup)
+        dit.train()
+
+
+# ====================================================================== #
+# Checkpoint
+# ====================================================================== #
+def save_checkpoint(
+    path: str,
+    adapters: Dict[str, LoRALinear],
+    ema: LoRAEMA,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    iteration: int,
+    config: Dict[str, Any],
+) -> None:
+    """保存 LoRA 权重、EMA、优化器 / 调度器状态与迭代数。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    state: Dict[str, Any] = {
+        "iteration": iteration,
+        "lora": lora_state_dict(adapters),
+        "ema": {k: v.clone() for k, v in ema.shadow.items()},
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "config": config,
+    }
+    torch.save(state, path)
+    LOGGER.info("已保存 checkpoint: %s", path)
+
+
+def load_checkpoint(
+    path: str,
+    adapters: Dict[str, LoRALinear],
+    ema: LoRAEMA,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    device: torch.device,
+) -> int:
+    """从 checkpoint 恢复训练，返回起始迭代数。"""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"checkpoint 不存在: {path}")
+    state = torch.load(path, map_location=device)
+
+    load_lora_state_dict(adapters, state["lora"])
+    if "ema" in state:
+        for key, value in ema.shadow.items():
+            if key in state["ema"]:
+                value.copy_(state["ema"][key].to(value.device))
+    else:
+        LOGGER.warning("checkpoint 缺少 EMA 状态，EMA 将以当前 LoRA 权重重新起步")
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+
+    start_iteration = int(state.get("iteration", 0)) + 1
+    LOGGER.info("已从 %s 恢复，起始迭代 %d", path, start_iteration)
+    return start_iteration
+
+
+# ====================================================================== #
+# 主流程
+# ====================================================================== #
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(description="TripoSG LoRA diffusion fine-tuning")
+    parser.add_argument("--config", type=str, default="configs/train_diffusion.yaml")
+    parser.add_argument("--resume", type=str, default=None, help="checkpoint 路径")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config)
+    train_cfg = config.get("training", {})
+    log_cfg = config.get("logging", {})
+
+    output_dir = str(log_cfg.get("output_dir", "./outputs/diffusion_train"))
+    setup_logging(output_dir)
+    set_seed(args.seed)
+
+    log_interval = int(log_cfg.get("log_interval", 50))
+    save_interval = int(log_cfg.get("save_interval", 2000))
+    eval_interval = int(log_cfg.get("eval_interval", 1000))
+    max_iterations = int(train_cfg.get("max_iterations", 50000))
+    warmup_steps = int(train_cfg.get("warmup_steps", 500))
+    use_bf16 = bool(train_cfg.get("use_bf16", True))
+    ema_decay = float(train_cfg.get("ema_decay", 0.9999))
+    accumulation_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
+    timestep_scale = float(train_cfg.get("timestep_scale", 1000.0))
+    learning_rate = float(train_cfg.get("learning_rate", 1e-4))
+
+    device = torch.device(args.device)
+    LOGGER.info("扩散 LoRA 微调启动：device=%s, bf16=%s", device, use_bf16)
+
+    # ---- 模型 / 优化器 / 调度器 ----
+    dit, adapters, vae = build_dit_with_lora(config, device)
+    if bool(train_cfg.get("gradient_checkpointing", True)):
+        num_wrapped = enable_gradient_checkpointing(dit)
+        LOGGER.info("梯度检查点：包装了 %d 个 transformer block", num_wrapped)
+
+    lora_params = [
+        param for adapter in adapters.values() for param in (adapter.lora_A, adapter.lora_B)
+    ]
+    optimizer = torch.optim.AdamW(lora_params, lr=learning_rate, weight_decay=0.01)
+    # 调度器按实际优化器步数构建（每 accumulation_steps 个迭代才 step 一次），
+    # 与训练循环中 scheduler.step() 的调用频率保持一致
+    total_optim_steps = max(1, max_iterations // accumulation_steps)
+    scheduler = build_scheduler(optimizer, warmup_steps, total_optim_steps)
+    ema = LoRAEMA(adapters, ema_decay)
+
+    # ---- 数据 ----
+    cache_dir = str(config.get("data", {}).get("latent_cache_dir", "./cache/triposg_latents"))
+    critic_weights_path = train_cfg.get("critic_weights_path", None)
+    dataset = LatentCacheDataset(
+        cache_dir,
+        critic_weights_path=str(critic_weights_path) if critic_weights_path else None,
+    )
+    # 样本数不足 batch_size 时 drop_last=True 会让 infinite_batches 永远不产出，提前报错
+    batch_size = int(train_cfg.get("batch_size", 32))
+    if len(dataset) < batch_size:
+        raise RuntimeError(
+            f"数据集样本数 ({len(dataset)}) 小于 batch_size ({batch_size})，"
+            f"请减小 batch_size 或增大缓存数据量"
+        )
+    loader = build_dataloader(config, dataset)
+    batches = infinite_batches(loader)
+    LOGGER.info("latent 数据集：%d 个样本（%s）", len(dataset), cache_dir)
+
+    # ---- Learned Semantic Reward 训练加权统计 ----
+    if dataset.critic_weights:
+        weighted = sum(
+            1 for shard_name, inner_idx in dataset.index
+            if _dataset_uid_weighted(dataset, shard_name, inner_idx)
+        )
+        # 覆盖率扫描会把全部 shard 读进进程缓存，统计完立即释放内存
+        dataset._shard_cache.clear()
+        values = list(dataset.critic_weights.values())
+        LOGGER.info(
+            "Critic 训练加权已启用：%s（权重表 %d 条，样本覆盖率 %.1f%%，"
+            "weight 均值 %.3f min %.3f max %.3f；缺失 uid 按 1.0）",
+            critic_weights_path,
+            len(values),
+            100.0 * weighted / max(len(dataset), 1),
+            sum(values) / len(values),
+            min(values),
+            max(values),
+        )
+
+    # ---- 断点续训 ----
+    start_iteration = 0
+    if args.resume:
+        start_iteration = load_checkpoint(
+            args.resume, adapters, ema, optimizer, scheduler, device
+        )
+
+    # ---- TensorBoard ----
+    writer = None
+    if HAS_TENSORBOARD:
+        writer = SummaryWriter(os.path.join(output_dir, "tb"))
+    else:
+        LOGGER.warning("tensorboard 未安装，跳过标量 / 图像日志")
+
+    # ---- 训练循环（训练步内不做任何渲染 / VAE 调用）----
+    optimizer.zero_grad(set_to_none=True)
+    loss_window: List[float] = []
+    weight_window: List[float] = []
+    grad_norm = 0.0
+    time_start = time.time()
+
+    for iteration in range(start_iteration, max_iterations):
+        batch = next(batches)
+        latents = batch["latent"].to(device, non_blocking=True)
+        cond = batch.get("image_embeds", None)
+        if cond is not None:
+            cond = cond.to(device, non_blocking=True)
+        # Learned Semantic Reward 训练加权：未配置 critic_weights_path 时恒为 None，行为不变
+        sample_weights = None
+        if dataset.critic_weights:
+            sample_weights = batch["weight"].to(device, non_blocking=True)
+
+        loss = train_step(
+            dit, latents, use_bf16, timestep_scale, cond, sample_weights
+        ) / accumulation_steps
+        loss.backward()
+
+        loss_window.append(loss.item() * accumulation_steps)
+        if sample_weights is not None:
+            weight_window.append(float(sample_weights.mean().item()))
+
+        if (iteration + 1) % accumulation_steps == 0:
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(lora_params, GRAD_CLIP).item()
+            )
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            ema.update(adapters)
+
+        # ---- 日志（文本日志不依赖 TensorBoard）----
+        if iteration % log_interval == 0 and loss_window:
+            avg_loss = sum(loss_window) / len(loss_window)
+            current_lr = scheduler.get_last_lr()[0]
+            weight_info = ""
+            if weight_window:
+                avg_weight = sum(weight_window) / len(weight_window)
+                weight_info = f" | sample_weight {avg_weight:.3f}"
+            LOGGER.info(
+                "iter %d/%d | loss %.4f | lr %.2e | grad_norm %.3f%s",
+                iteration,
+                max_iterations,
+                avg_loss,
+                current_lr,
+                grad_norm,
+                weight_info,
+            )
+            if writer is not None:
+                writer.add_scalar("train/loss", avg_loss, iteration)
+                writer.add_scalar("train/lr", current_lr, iteration)
+                writer.add_scalar("train/grad_norm", grad_norm, iteration)
+                if weight_window:
+                    writer.add_scalar(
+                        "train/sample_weight", sum(weight_window) / len(weight_window), iteration
+                    )
+            loss_window.clear()
+            weight_window.clear()
+
+        # ---- 定期评估 ----
+        if eval_interval > 0 and (iteration + 1) % eval_interval == 0:
+            run_evaluation(
+                iteration + 1, dit, adapters, ema, vae, dataset, config, device, writer
+            )
+
+        # ---- 定期保存 ----
+        if save_interval > 0 and (iteration + 1) % save_interval == 0:
+            save_checkpoint(
+                os.path.join(output_dir, f"ckpt_{iteration + 1:07d}.pt"),
+                adapters,
+                ema,
+                optimizer,
+                scheduler,
+                iteration + 1,
+                config,
+            )
+
+    # ---- 收尾：最终 checkpoint + 导出纯 LoRA 权重（便于推理侧加载）----
+    final_path = os.path.join(output_dir, "ckpt_final.pt")
+    save_checkpoint(final_path, adapters, ema, optimizer, scheduler, max_iterations, config)
+    torch.save(
+        {"lora": lora_state_dict(adapters), "ema": dict(ema.shadow)},
+        os.path.join(output_dir, "lora_weights.pt"),
+    )
+    if writer is not None:
+        writer.close()
+
+    elapsed = time.time() - time_start
+    LOGGER.info(
+        "训练完成：%d 步，耗时 %.1f 分钟，输出目录 %s",
+        max_iterations - start_iteration,
+        elapsed / 60.0,
+        output_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()

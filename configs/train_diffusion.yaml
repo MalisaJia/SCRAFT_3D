@@ -1,0 +1,73 @@
+# ============================================================================
+# Diffusion model LoRA fine-tuning configuration
+# ============================================================================
+
+model:
+  backend: "diffusion"
+  diffusion:
+    model_name: "TripoSG"
+    weights_path: "./weights/triposg"
+    lora_rank: 16
+    # 真实 TripoSG DiT 的注意力投影为 diffusers 风格 to_q / to_v
+    lora_target_modules: ["to_q", "to_v"]
+
+# Training
+training:
+  batch_size: 32
+  learning_rate: 1.0e-4
+  lr_scheduler: "cosine"
+  warmup_steps: 500
+  max_iterations: 3000
+  gradient_accumulation_steps: 2
+  use_bf16: true
+  gradient_checkpointing: true
+  ema_decay: 0.9999
+  # RectifiedFlowScheduler 约定：t ∈ [0,1] 缩放至 [0, 1000] 后送入 DiT
+  timestep_scale: 1000.0
+  # Learned Semantic Reward 训练加权：指向 scripts/score_latents_critic.py 产出的
+  # critic_weights.json（{uid: weight}，均值已归一到 1.0）；按 uid 逐样本加权
+  # 扩散 MSE 损失，缺失 uid 按 1.0。null = 不启用，训练行为与原来完全一致
+  critic_weights_path: /root/autodl-tmp/3D-gans/cache/triposg_latents_objaverse/critic_weights.json
+
+# Data
+data:
+  # Objaverse 流式扩容 5000 样本 latent 缓存（任务 #30 预计算产出）
+  latent_cache_dir: "/root/autodl-tmp/3D-gans/cache/triposg_latents_objaverse"
+  annotations_path: "/root/autodl-tmp/objaverse_data/annotations.json"
+  num_workers: 4
+
+# Logging
+logging:
+  log_interval: 50
+  save_interval: 2000
+  eval_interval: 1000
+  output_dir: "./outputs/diffusion_train_reward_v2"
+
+# Rendering
+# 评估阶段（run_evaluation）多视角预览渲染参数；缺失该段时回落到代码内默认值
+rendering:
+  image_size: 256
+  num_views: 4
+  camera_distance: 2.5
+  elevation_range: [-30, 30]
+
+# Evaluation
+# 附加评估指标，全部可选：任一依赖不可用时静默跳过，不影响训练主流程
+evaluation:
+  # 验证损失计算间隔（步）；<= 0 关闭
+  interval: 500
+  # 从 latent 缓存尾部切出的 held-out 验证样本数（永不参与训练）；
+  # 0 = 不切分，训练集与未启用该功能时完全一致。保持小规模（8~16）控制评估耗时
+  num_val_samples: 16
+  # 验证前向的 batch 大小（无梯度，可小于训练 batch 以省显存）
+  val_batch_size: 4
+  # eval/clip_score 用的 CLIP backbone；null = 关闭 CLIP Score（Critic Score 也依赖它）
+  clip_model_name: "ViT-B/32"
+  clip_pretrained: "openai"
+  # eval/critic_score 用的 SemanticCritic checkpoint（inference.build_critic 加载，
+  # 需含 state['critic']）；相对路径以训练启动时的工作目录为基准
+  # （服务器项目根 /root/autodl-tmp/3D-gans）。建议指向 Learned Semantic Reward
+  # 继续教育产出（scripts/finetune_critic.py --out，与 score_latents_critic.py
+  # 的 --critic 默认值同一约定）；null = 跳过。
+  # 注意与 training.critic_weights_path（uid -> 权重 JSON）不是同一个文件
+  critic_checkpoint: ./outputs/critic_v2_rerun.pt

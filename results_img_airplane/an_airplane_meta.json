@@ -1,0 +1,65 @@
+{
+  "prompt": "an airplane",
+  "prompt_slug": "an_airplane",
+  "backend": "diffusion",
+  "config": "/root/autodl-tmp/3D-gans/configs/diffusion_inference_reward.yaml",
+  "image": "/root/autodl-tmp/3D-gans/cond_images/airplane.png",
+  "device": "cuda",
+  "seed": 1742087261,
+  "num_views": 8,
+  "image_size": 256,
+  "num_vertices": 27188,
+  "num_faces": 54292,
+  "text_guided": true,
+  "num_candidates": 8,
+  "scorer": "clip",
+  "candidate_clip_scores": [
+    0.20411,
+    0.20737,
+    0.21664,
+    0.21477,
+    0.21099,
+    0.21137,
+    0.20824,
+    0.21904
+  ],
+  "candidate_critic_scores": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "candidate_scores": [
+    0.20411,
+    0.20737,
+    0.21664,
+    0.21477,
+    0.21099,
+    0.21137,
+    0.20824,
+    0.21904
+  ],
+  "optimize_steps": 0,
+  "optimize_lr": 0.02,
+  "optimize_history": [],
+  "clip_score": 0.21904,
+  "critic_score": null,
+  "generator_config": {
+    "model_name": "TripoSG",
+    "weights_path": "./weights/triposg",
+    "num_steps": 50,
+    "cfg_scale": 7.0,
+    "octree_resolution": 256,
+    "lora_weights_path": "outputs/diffusion_train_reward/lora_weights.pt"
+  },
+  "elapsed_seconds": 71.773,
+  "timestamp": "2026-08-15T02:37:17",
+  "outputs": {
+    "mesh": "/root/autodl-tmp/3D-gans/results_img_airplane/an_airplane_mesh.obj",
+    "views": "/root/autodl-tmp/3D-gans/results_img_airplane/an_airplane_views.png"
+  }
+}

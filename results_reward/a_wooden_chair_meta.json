@@ -1,0 +1,64 @@
+{
+  "prompt": "a wooden chair",
+  "prompt_slug": "a_wooden_chair",
+  "backend": "diffusion",
+  "config": "/root/autodl-tmp/3D-gans/configs/diffusion_inference_reward.yaml",
+  "device": "cuda",
+  "seed": 735696917,
+  "num_views": 8,
+  "image_size": 256,
+  "num_vertices": 29132,
+  "num_faces": 58136,
+  "text_guided": true,
+  "num_candidates": 8,
+  "scorer": "clip",
+  "candidate_clip_scores": [
+    0.20797,
+    0.21946,
+    0.20531,
+    0.21389,
+    0.22006,
+    0.22025,
+    0.2144,
+    0.20779
+  ],
+  "candidate_critic_scores": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "candidate_scores": [
+    0.20797,
+    0.21946,
+    0.20531,
+    0.21389,
+    0.22006,
+    0.22025,
+    0.2144,
+    0.20779
+  ],
+  "optimize_steps": 0,
+  "optimize_lr": 0.02,
+  "optimize_history": [],
+  "clip_score": 0.22025,
+  "critic_score": null,
+  "generator_config": {
+    "model_name": "TripoSG",
+    "weights_path": "./weights/triposg",
+    "num_steps": 50,
+    "cfg_scale": 7.0,
+    "octree_resolution": 256,
+    "lora_weights_path": "outputs/diffusion_train_reward/lora_weights.pt"
+  },
+  "elapsed_seconds": 81.173,
+  "timestamp": "2026-08-15T02:03:13",
+  "outputs": {
+    "mesh": "/root/autodl-tmp/3D-gans/results_reward/a_wooden_chair_mesh.obj",
+    "views": "/root/autodl-tmp/3D-gans/results_reward/a_wooden_chair_views.png"
+  }
+}

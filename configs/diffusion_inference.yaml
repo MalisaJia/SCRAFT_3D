@@ -1,0 +1,48 @@
+# ============================================================================
+# Diffusion model inference configuration
+# ============================================================================
+
+model:
+  backend: "diffusion"  # 本项目仅支持 diffusion 后端（见 models/diffusion_adapter.py）
+  diffusion:
+    model_name: "TripoSG"
+    weights_path: "./weights/triposg"  # TripoSG 权重目录（留空则从 HuggingFace 拉取）
+    num_steps: 50
+    cfg_scale: 7.0
+    octree_resolution: 256
+    lora_weights_path: outputs/diffusion_train/lora_weights.pt  # 微调 LoRA 权重路径（train_diffusion.py 输出；置 null 不注入）
+
+# Rendering (same as train_config.yaml)
+rendering:
+  image_size: 256
+  num_views: 8
+  camera_distance: 2.5
+  elevation_range: [-30, 30]
+  azimuth_strategy: "fixed"
+
+# VLM (same as train_config.yaml)
+vlm:
+  model_name: "ViT-B/32"
+  clip_dim: 512
+  pretrained: "openai"
+
+# Inference
+inference:
+  num_candidates: 8  # 种子重排采样的种子数（TripoSG 无文本条件，靠种子多样性 + 打分筛选）
+  output_dir: "./outputs/diffusion"
+
+  # ---- 种子重排打分器（论文核心：SemanticCritic 接入推理重排）----
+  # clip:   CLIP 图文相似度（默认，向后兼容）
+  # critic: SemanticCritic 结构合理性分数（CLIP 多视角聚合特征 + 几何统计描述子）
+  # combo:  两路分数各自在候选集内 min-max 归一后加权：
+  #         score = (1 - critic_weight) * clip_norm + critic_weight * critic_norm
+  # combo_prod: 两路分数各自 min-max 归一后相乘（双门槛，语义与结构缺一不可）：
+  #         score = clip_norm * critic_norm + 1e-9（max==min 时归一退化为全 0.5）
+  scorer: "clip"
+  # Critic checkpoint（含 'critic' 键）；scorer=critic/combo/combo_prod 时必需。
+  # 建议指向 Learned Semantic Reward 继续教育产出的 critic_v2：
+  #   outputs/critic_v2.pt（scripts/finetune_critic.py --out 输出，格式与旧 ckpt 一致）；
+  # 未继续教育时也可继续用已有的 Critic 训练 checkpoint（如下方默认值）
+  critic_checkpoint: outputs/ablation_a0_full/ckpt_final.pt
+  # combo 模式下 critic 分数权重 w（clip 权重 = 1 - w）
+  critic_weight: 0.5
