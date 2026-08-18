@@ -229,21 +229,67 @@ def load_triposg_vae(weights_path: str, device: torch.device):
     return vae
 
 
+# DINOv2 图像条件的官方口径 token 数：feature_extractor_dinov2 把图 resize +
+# center-crop 到 224×224，patch_size=14 -> (224/14)^2 = 256 patches + 1 CLS = 257。
+# 推理管线 encode_image 运行时实测 [1, 257, 1024]。预计算必须与之一致。
+EXPECTED_DINO_NUM_TOKENS = 257
+
+
+def verify_dinov2_calibration(processor, encoder) -> int:
+    """校验 DINOv2 processor 口径，返回 dummy 图过编码器后的 token 数。
+
+    用一张 dummy 512×512 图走一遍 processor + encoder，统计 last_hidden_state
+    的 token 数；必须等于官方 TripoSG feature_extractor 的 257（224/center-crop，
+    patch14 -> 256 patches + 1 CLS）。不等则直接 RuntimeError 退出，防止再次
+    出现训练/推理口径漂移（历史上曾因手工覆盖 518px 产出 1370 tokens 导致
+    LoRA 生成团块）。
+    """
+    from PIL import Image
+
+    size_cfg = getattr(processor, "size", None)
+    crop_cfg = getattr(processor, "crop_size", None)
+    dummy = Image.new("RGB", (512, 512), color=(127, 127, 127))
+    inputs = processor(images=dummy, return_tensors="pt")
+    device = next(encoder.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        tokens = int(encoder(**inputs).last_hidden_state.shape[1])
+    print(
+        f"[口径校验] DINOv2 processor size={size_cfg} crop_size={crop_cfg} "
+        f"| dummy 512x512 -> {tokens} tokens（官方口径应为 {EXPECTED_DINO_NUM_TOKENS}）",
+        flush=True,
+    )
+    if tokens != EXPECTED_DINO_NUM_TOKENS:
+        raise RuntimeError(
+            f"DINOv2 口径漂移：dummy 512x512 得到 {tokens} tokens，"
+            f"预期官方 {EXPECTED_DINO_NUM_TOKENS}（224/center-crop/patch14）。"
+            "请确认 feature_extractor_dinov2 与推理管线 encode_image 同源，"
+            "且未对 processor 做任何 size/crop 覆盖。"
+        )
+    return tokens
+
+
 def load_dinov2_encoder(weights_path: str, device: torch.device):
-    """懒加载 pipeline 自带的 DINOv2 图像编码器 + 特征提取器（可选）。
+    """懒加载 pipeline 自带的 DINOv2 图像编码器 + 官方特征提取器（可选）。
 
     用于把每个 mesh 的参考图（若存在）编码为 cross-attention 条件嵌入；
     权重目录缺少 image_encoder_dinov2 子目录时返回 None（训练侧退化到
     零嵌入无条件分支）。
-    """
-    try:
-        weights_dir = Path(weights_path) if weights_path else None
-        if weights_dir is not None and weights_dir.is_file():
-            weights_dir = weights_dir.parent
-        if weights_dir is None or not (weights_dir / "image_encoder_dinov2").is_dir():
-            print("[信息] 权重目录缺少 image_encoder_dinov2，跳过图像嵌入预计算")
-            return None
 
+    processor 一律用 ``AutoImageProcessor.from_pretrained`` 直接加载权重目录
+    下的官方 ``feature_extractor_dinov2`` 子目录（224/center-crop，257 tokens），
+    与推理侧 ``models/diffusion_adapter.py`` / 官方 pipeline 的 encode_image 同源；
+    **禁止**对 size/crop_size 做任何手工覆盖。加载成功后立即用
+    ``verify_dinov2_calibration`` 以 dummy 图校验 token 数，漂移则 RuntimeError。
+    """
+    weights_dir = Path(weights_path) if weights_path else None
+    if weights_dir is not None and weights_dir.is_file():
+        weights_dir = weights_dir.parent
+    if weights_dir is None or not (weights_dir / "image_encoder_dinov2").is_dir():
+        print("[信息] 权重目录缺少 image_encoder_dinov2，跳过图像嵌入预计算")
+        return None
+
+    try:
         from transformers import AutoImageProcessor, AutoModel
 
         processor = AutoImageProcessor.from_pretrained(
@@ -253,10 +299,13 @@ def load_dinov2_encoder(weights_path: str, device: torch.device):
         encoder = encoder.to(device).eval()
         for param in encoder.parameters():
             param.requires_grad_(False)
-        return processor, encoder
     except Exception as exc:
         print(f"[警告] DINOv2 编码器加载失败（{exc}），跳过图像嵌入预计算")
         return None
+
+    # 口径校验放在 try/except 之外：漂移必须 RuntimeError 直接退出，不能被兜底吞掉
+    verify_dinov2_calibration(processor, encoder)
+    return processor, encoder
 
 
 # ====================================================================== #

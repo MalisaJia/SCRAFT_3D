@@ -1,0 +1,73 @@
+# ============================================================================
+# v4 全量重训配方（574 样本椅子专训）：由 configs/train_diffusion_chair_v4.yaml
+# 原样派生——全量缓存 cache/triposg_latents_chair_v2、800 步、
+# output_dir ./outputs/diffusion_train_chair_v4 均与模板一致，无字段改动。
+# 独立成文件是为了与 canary 门禁配置区分、便于服务器侧 nohup 直接引用。
+# 门禁背景：v4 四条修复（cross-attn only 42 挂点 / rank4+lr3e-5+800 步 /
+# lora_B weight_decay 1e-2 锚零 / 按 eval clip×critic 留 ckpt_best.pt）
+# 先经单样本 canary 门禁验证通过后才点本配置的火。
+# ============================================================================
+
+model:
+  backend: "diffusion"
+  diffusion:
+    model_name: "TripoSG"
+    weights_path: "./weights/triposg"
+    # 降容：rank 16 -> 4（可训练参数随之缩减约 4 倍）
+    lora_rank: 4
+    # 配方 1：带点后缀模式仅匹配 blocks.{i}.attn2.{to_q,to_v}（cross-attention），
+    # 挂点从 84 降到 42；推理侧 lora_target_modules 需与本配置保持一致
+    lora_target_modules: ["attn2.to_q", "attn2.to_v"]
+
+# Training
+training:
+  batch_size: 32
+  # 降火：lr 1e-4 -> 3e-5
+  learning_rate: 3.0e-5
+  lr_scheduler: "cosine"
+  warmup_steps: 100
+  # 降火：3000 -> 800
+  max_iterations: 800
+  gradient_accumulation_steps: 2
+  use_bf16: true
+  gradient_checkpointing: true
+  ema_decay: 0.9999
+  timestep_scale: 1000.0
+  # Learned Semantic Reward 训练加权（v3 同款）：{uid: weight} 均值归一到 1.0
+  critic_weights_path: /root/autodl-tmp/3D-gans/cache/triposg_latents_chair_v2/critic_weights.json
+  # Condition dropout 0.1：CFG uncond 零嵌入分支留在 LoRA 分布内
+  condition_dropout: 0.1
+  # 配方 3（B 矩阵锚）：lora_B 单独参数组施加该 weight_decay，锚向零
+  lora_b_weight_decay: 1.0e-2
+  # 配方 4：按生成质量留 ckpt_best.pt（复合分 = eval clip × critic）
+  save_best_checkpoint: true
+
+# Data
+data:
+  # 257 口径椅子全量缓存（574 样本白名单子集 + critic_weights.json）
+  latent_cache_dir: "/root/autodl-tmp/3D-gans/cache/triposg_latents_chair_v2"
+  annotations_path: "/root/autodl-tmp/objaverse_data/annotations.json"
+  num_workers: 4
+
+# Logging
+logging:
+  log_interval: 50
+  save_interval: 400
+  eval_interval: 100
+  output_dir: "./outputs/diffusion_train_chair_v4"
+
+# Rendering
+rendering:
+  image_size: 256
+  num_views: 4
+  camera_distance: 2.5
+  elevation_range: [-30, 30]
+
+# Evaluation
+evaluation:
+  interval: 100
+  num_val_samples: 16
+  val_batch_size: 4
+  clip_model_name: "ViT-B/32"
+  clip_pretrained: "openai"
+  critic_checkpoint: ./outputs/critic_v2_rerun.pt

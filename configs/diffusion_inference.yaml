@@ -11,6 +11,11 @@ model:
     cfg_scale: 7.0
     octree_resolution: 256
     lora_weights_path: outputs/diffusion_train/lora_weights.pt  # 微调 LoRA 权重路径（train_diffusion.py 输出；置 null 不注入）
+    # 注意：lora_target_modules 必须与训练侧配置一致（缺省 ["to_q", "to_v"]
+    # 即 84 挂点）。加载 v4 cross-attn-only（42 挂点）权重时必须显式加：
+    #   lora_target_modules: ["attn2.to_q", "attn2.to_v"]
+    # 否则挂点树与权重键不匹配，load_lora_state_dict 会直接 KeyError
+    # （未消费键 / 缺键双向校验，不会静默丢弃 attn1 增量）
 
 # Rendering (same as train_config.yaml)
 rendering:

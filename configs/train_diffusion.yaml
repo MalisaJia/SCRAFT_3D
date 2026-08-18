@@ -28,6 +28,18 @@ training:
   # critic_weights.json（{uid: weight}，均值已归一到 1.0）；按 uid 逐样本加权
   # 扩散 MSE 损失，缺失 uid 按 1.0。null = 不启用，训练行为与原来完全一致
   critic_weights_path: /root/autodl-tmp/3D-gans/cache/triposg_latents_objaverse/critic_weights.json
+  # Condition dropout：训练期逐样本独立以该概率把 image_embeds 整条置零
+  # （zeros_like，与官方 CFG 空分支一致），让推理 CFG 的 uncond 零嵌入分支
+  # 留在 LoRA 分布内，避免高 cfg_scale 外推放大损坏。0.0 = 不启用（默认，
+  # 训练行为与未引入该功能时完全一致）
+  condition_dropout: 0.0
+  # B 矩阵锚（v4 新增）：lora_B 单独参数组施加的 weight_decay。0.0 = 关闭，
+  # 与未引入该功能时逐位一致；>0 时 lora_B 锚向零、lora_A 保持默认 0.01
+  lora_b_weight_decay: 0.0
+  # best checkpoint 跟踪（v4 新增）：true 时按 eval 复合分（clip × critic）
+  # 刷新保存 ckpt_best.pt 并打 BEST_UPDATE 日志。false = 关闭，与未引入
+  # 该功能时逐位一致（不产生任何新文件 / 新日志）
+  save_best_checkpoint: false
 
 # Data
 data:

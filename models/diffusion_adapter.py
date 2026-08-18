@@ -324,7 +324,7 @@ class DiffusionMeshGenerator:
         return Image.open(image).convert("RGB")
 
     @staticmethod
-    def _synthesize_condition_image(seed: int, size: int = 518):
+    def _synthesize_condition_image(seed: int, size: int = 224):
         """由种子派生确定性程序化条件图（平滑随机色斑拼图）。
 
         TripoSG 的 DINOv2 编码器对任意 RGB 图都能给出嵌入；不同种子的图

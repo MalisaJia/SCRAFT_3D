@@ -1,0 +1,95 @@
+# ============================================================================
+# v4 训练配方：TripoSG 椅子 LoRA 微调（降容降火 + cross-attn only + B 矩阵锚）
+# ----------------------------------------------------------------------------
+# 背景：v3 满火力（rank16 / 84 挂点 / lr1e-4 / 3000 步）"方向对、幅度失控"，
+# 推理端打 1 折才恢复完整椅子。v4 四条修复全部落在训练侧：
+#   1. 仅挂 cross-attention（attn2，挂点 84 -> 42）
+#   2. 降容降火：rank 4、lr 3e-5、800 步、condition_dropout 0.1
+#   3. B 矩阵锚：lora_B 单独参数组 weight_decay 1e-2
+#   4. 按生成质量留 ckpt_best.pt（复合分 = eval clip × critic，见 BestCheckpointer）
+# 注意：禁止 --resume 指向 v1~v3 checkpoint（挂点结构 84 vs 42、参数组拆分
+# 均不兼容，load_lora_state_dict / 优化器状态恢复会大声报错，不会静默错训）
+# ============================================================================
+
+model:
+  backend: "diffusion"
+  diffusion:
+    model_name: "TripoSG"
+    # TODO(server): 服务器专属路径，由服务器侧负责人填入真实 TripoSG 权重目录
+    weights_path: "./weights/triposg"
+    # 降容：rank 16 -> 4（可训练参数随之缩减约 4 倍）
+    lora_rank: 4
+    # 配方 1：带点后缀模式仅匹配 blocks.{i}.attn2.{to_q,to_v}（cross-attention），
+    # 挂点从 84 降到 42；推理侧 diffusion_inference.yaml 的 lora_target_modules
+    # 需与本配置保持一致才能复现同一套挂点树
+    lora_target_modules: ["attn2.to_q", "attn2.to_v"]
+
+# Training
+training:
+  batch_size: 32
+  # 降火：lr 1e-4 -> 3e-5
+  learning_rate: 3.0e-5
+  lr_scheduler: "cosine"
+  # 总步数只有 800，warmup 相应缩短（原 500 会吞掉大半训练预算）
+  warmup_steps: 100
+  # 降火：3000 -> 800
+  max_iterations: 800
+  gradient_accumulation_steps: 2
+  use_bf16: true
+  gradient_checkpointing: true
+  ema_decay: 0.9999
+  # RectifiedFlowScheduler 约定：t ∈ [0,1] 缩放至 [0, 1000] 后送入 DiT
+  timestep_scale: 1000.0
+  # Learned Semantic Reward 训练加权保留（v3 同款）：指向 critic_weights.json
+  # （{uid: weight}，均值已归一到 1.0），按 uid 逐样本加权扩散 MSE 损失。
+  # 指向 257 口径椅子缓存内已复制就位的那份（v3 训练即用它）
+  critic_weights_path: /root/autodl-tmp/3D-gans/cache/triposg_latents_chair_v2/critic_weights.json
+  # Condition dropout 0.1：CFG uncond 零嵌入分支留在 LoRA 分布内
+  condition_dropout: 0.1
+  # 配方 3（B 矩阵锚）：lora_B 单独参数组施加该 weight_decay，把 B 锚向零、
+  # 抑制 LoRA 增量幅度失控；lora_A 保持默认 0.01。0.0 = 关闭（与历史行为一致）
+  lora_b_weight_decay: 1.0e-2
+  # 配方 4：开启按生成质量留 ckpt_best.pt（复合分 = eval clip × critic，
+  # 未归一化；每次 best 刷新时保存并打 BEST_UPDATE 日志；ckpt_final 照旧）
+  save_best_checkpoint: true
+
+# Data
+data:
+  # 257 口径椅子缓存（590 样本 257 嵌入，含 critic_weights.json /
+  # clip_sem_scores.json，v3 训练即用它；禁止与旧 1370 口径缓存混用，
+  # LatentCacheDataset 初始化时会扫描全部 shard 形状并报错拦截）
+  latent_cache_dir: "/root/autodl-tmp/3D-gans/cache/triposg_latents_chair_v2"
+  annotations_path: "/root/autodl-tmp/objaverse_data/annotations.json"
+  num_workers: 4
+
+# Logging
+logging:
+  log_interval: 50
+  # 800 步总预算：400 步留一个中途 ckpt，收尾照常产 ckpt_final.pt；
+  # best 刷新由训练内 eval 驱动（ckpt_best.pt，不受本间隔控制）
+  save_interval: 400
+  # 配方 4：800 步内每 100 步做一次生成评估（共 8 次），best 竞争粒度适中
+  eval_interval: 100
+  # TODO(server): 如需独立输出目录，由服务器侧负责人调整
+  output_dir: "./outputs/diffusion_train_chair_v4"
+
+# Rendering
+# 评估阶段（run_evaluation）多视角预览渲染参数；缺失该段时回落到代码内默认值
+rendering:
+  image_size: 256
+  num_views: 4
+  camera_distance: 2.5
+  elevation_range: [-30, 30]
+
+# Evaluation
+# 附加评估指标，全部可选：任一依赖不可用时静默跳过，不影响训练主流程
+evaluation:
+  # held-out 验证 MSE 间隔：与 eval_interval 对齐（800 步共 8 次）
+  interval: 100
+  num_val_samples: 16
+  val_batch_size: 4
+  clip_model_name: "ViT-B/32"
+  clip_pretrained: "openai"
+  # SemanticCritic checkpoint（含 state['critic']）；若不可用则 critic_score
+  # 缺失，best 跟踪因缺一项指标自动不参与竞争（收尾会有 warning 提示）
+  critic_checkpoint: ./outputs/critic_v2_rerun.pt

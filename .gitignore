@@ -18,6 +18,7 @@ nohup.out
 outputs/
 results_v2/
 results_img_chair/
+results_chair/
 *.log
 cache/
 weights/

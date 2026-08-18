@@ -5,7 +5,7 @@
 HuggingFace ``allenai/objaverse`` resolve 直链下载 glb（无 tar、无断点残留）。
 本脚本复用同款方式：逐个 uid 下载 glb 到暂存目录 -> trimesh 过滤 -> 归一化 ->
 VAE encode latent [2048,64] fp16 -> 单视图渲染 512 -> DINOv2 image_embeds
-[1370,1024] fp16 -> 追加 shard（与 train_diffusion.py 的 LatentCacheDataset 兼容），
+[257,1024] fp16 -> 追加 shard（与 train_diffusion.py 的 LatentCacheDataset 兼容），
 处理完即删 glb；manifest 记录已尝试 uid，支持断点续跑。
 
 用法（服务器上）：
@@ -61,7 +61,6 @@ DEFAULT_CACHE_DIR = "/root/autodl-tmp/3D-gans/cache/triposg_latents_objaverse"
 DEFAULT_TMP_DIR = "/root/autodl-tmp/objaverse_stream_tmp"
 DEFAULT_WEIGHTS = "/root/autodl-tmp/3D-gans/weights/triposg"
 DEFAULT_CAPTION = "a 3D model of an object"
-DINO_INPUT_SIZE = 518  # TripoSG pipeline 约定的 DINOv2 输入分辨率（37×37 patches）
 
 MIN_FACES = 500
 MAX_FACES = 300000
@@ -201,19 +200,15 @@ def render_reference_image(
 def encode_image_embeds_pil(
     dinov2: Any, image: Image.Image, device: torch.device
 ) -> torch.Tensor:
-    """DINOv2 + BitImageProcessor：last_hidden_state [1,1370,1024] -> fp16。
+    """DINOv2 + 官方 feature_extractor：last_hidden_state [1,257,1024] -> fp16。
 
-    权重目录里的 feature_extractor 预设为 224 输入（257 tokens），而
-    TripoSG pipeline 约定 518×518（37×37=1369 patches + CLS = 1370 tokens，
-    与训练侧 DIT_COND_NUM_TOKENS 一致），这里显式覆盖 resize/crop 尺寸。
+    直接沿用 ``load_dinov2_encoder`` 加载的官方 ``feature_extractor_dinov2``
+    （224/center-crop，patch14 -> 256 patches + 1 CLS = 257 tokens），不做任何
+    size/crop 覆盖，确保与推理管线 encode_image 的口径严格一致。加载阶段已由
+    ``verify_dinov2_calibration`` 用 dummy 图校验过 token 数（!=257 即退出）。
     """
     processor, encoder = dinov2
-    inputs = processor(
-        images=image,
-        return_tensors="pt",
-        size={"height": DINO_INPUT_SIZE, "width": DINO_INPUT_SIZE},
-        crop_size={"height": DINO_INPUT_SIZE, "width": DINO_INPUT_SIZE},
-    )
+    inputs = processor(images=image, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     ctx = (
         torch.cuda.amp.autocast(dtype=torch.bfloat16)

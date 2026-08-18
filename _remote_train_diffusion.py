@@ -15,9 +15,12 @@ Usage:
 4. 训练特性：bf16 autocast、梯度检查点、LoRA 权重 EMA、cosine LR + warmup
 5. 定期评估：用 EMA 权重 Euler 采样 latent -> VAE 解码 SDF ->
    ``triposg.inference_utils.hierarchical_extract_geometry`` 八叉树提取
-   -> ``MultiViewRenderer`` 渲染预览图（评估失败不影响训练）
-6. 日志：TensorBoard（loss / LR / grad_norm / 评估渲染图）+ 文本日志，
-   风格与 ``train.py`` 保持一致
+   -> ``MultiViewRenderer`` 渲染预览图（渲染参数取自配置 ``rendering`` 段；
+   评估失败不影响训练），并在依赖可用时附加 CLIP Score / Critic Score
+6. 可选 held-out 验证：从 latent 缓存尾部切出 ``evaluation.num_val_samples``
+   个样本（永不参与训练），每 ``evaluation.interval`` 步计算一次无梯度 MSE
+7. 日志：TensorBoard（loss / LR / grad_norm / 评估渲染图 / ``eval/*`` 指标）
+   + 文本日志，风格与 ``train.py`` 保持一致
 """
 
 from __future__ import annotations
@@ -62,19 +65,33 @@ GRAD_CLIP = 1.0
 # 评估时 Euler 采样的步数（预览用途，不必追求高质量）
 EVAL_NUM_STEPS = 25
 
-# 评估时 VAE 解码 SDF 的八叉树深度（res = 2^depth；7 -> 128，低分辨率换速度）
-EVAL_OCTREE_DEPTH = 7
+# 评估时 VAE 解码 SDF 的八叉树深度（res = 2^depth；8 -> 256，与正式推理
+# configs/diffusion_inference.yaml 的 octree_resolution=256 对齐）
+EVAL_OCTREE_DEPTH = 8
+
+# 评估采样的 classifier-free guidance 强度（与 TripoSG 官方推理默认值一致；
+# 基座在推理期依赖 CFG 放大条件方向，不加引导会偏离数据流形出碎片几何）
+EVAL_GUIDANCE_SCALE = 7.0
 
 # 真实 DiT 的 cross-attention 条件维度（DINOv2 large = 1024）
 DIT_COND_DIM = 1024
 
-# DINOv2 图像条件的 token 数：pipeline 的 feature_extractor 把图 resize 到
-# 518×518，patch_size=14 -> (518/14)^2 = 1369 patches + 1 CLS = 1370
-# （官方 CFG 空分支为 torch.zeros_like(image_embeds)，形状同 [B, 1370, 1024]）
-DIT_COND_NUM_TOKENS = 1370
+# DINOv2 图像条件的 token 数（仅作 shard 缺 image_embeds 时的兜底默认值；正常
+# 运行由数据集探测首个 shard 的实际形状）。官方 feature_extractor_dinov2 为
+# 224/center-crop，patch_size=14 -> (224/14)^2 = 256 patches + 1 CLS = 257
+# （官方 CFG 空分支为 torch.zeros_like(image_embeds)，形状同 [B, 257, 1024]）
+DIT_COND_NUM_TOKENS = 257
 
 # 每次评估渲染的样本数
 EVAL_NUM_SAMPLES = 4
+
+# 验证损失的固定噪声种子：每次验证复用同一批噪声 / 时间步，使不同步数之间的
+# 验证 MSE 可直接比较（否则 rectified flow 的随机 t 会带来很大方差）
+VAL_NOISE_SEED = 1234
+
+# 评估用 CLIP / Critic 的进程内缓存（键 -> 模型或 None）。这两个模型只在评估时
+# 用到，但重复加载很慢，因此加载一次后常驻；加载失败也记入缓存，避免每轮重试
+_EVAL_MODEL_CACHE: Dict[str, Any] = {}
 
 
 # ====================================================================== #
@@ -86,7 +103,9 @@ def load_config(path: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"配置文件不存在: {path}")
     with open(path, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
-    for block in ("model", "training", "data", "logging"):
+    # rendering / evaluation 为后加入的可选段，旧配置缺失时补空 dict，
+    # 读取方一律带默认值回落，训练行为与原来完全一致
+    for block in ("model", "training", "data", "logging", "rendering", "evaluation"):
         config.setdefault(block, {})
     return config
 
@@ -166,12 +185,27 @@ _TARGET_ALIASES: Dict[str, Tuple[str, ...]] = {
 }
 
 
-def _match_target(leaf_name: str, targets: List[str]) -> bool:
-    """判断模块叶子名是否命中任一目标（含别名展开）。"""
-    expanded: List[str] = []
+def _match_target(module_name: str, targets: List[str]) -> bool:
+    """判断模块名是否命中任一目标（含别名展开）。
+
+    两种匹配模式：
+
+    - **带点目标**（如 ``"attn2.to_q"``）：对完整模块名做**后缀匹配**
+      （``module_name == target`` 或以 ``"." + target`` 结尾），用于限定
+      注意力类型，例如只给 cross-attention（attn2）挂适配器；
+    - **裸名目标**（如 ``"to_q"``）：保持历史行为不变 —— 别名展开后
+      对叶子名做相等或子串匹配。
+    """
+    leaf = module_name.rsplit(".", 1)[-1] if "." in module_name else module_name
     for target in targets:
-        expanded.extend(_TARGET_ALIASES.get(target, (target,)))
-    return any(alias == leaf_name or alias in leaf_name for alias in expanded)
+        if "." in target:
+            if module_name == target or module_name.endswith("." + target):
+                return True
+            continue
+        for alias in _TARGET_ALIASES.get(target, (target,)):
+            if alias == leaf or alias in leaf:
+                return True
+    return False
 
 
 def inject_lora(
@@ -181,12 +215,17 @@ def inject_lora(
 
     真实 TripoSG DiT（``TripoSGDiTModel``）的自注意力 / 交叉注意力投影位于
     ``blocks.{i}.attn1.{to_q,to_v}`` 与 ``blocks.{i}.attn2.{to_q,to_v}``
-    （diffusers ``Attention`` 模块），目标名推荐直接写 ``["to_q", "to_v"]``。
+    （diffusers ``Attention`` 模块）。目标名支持两种写法：
+
+    - 裸名 ``["to_q", "to_v"]``：子串匹配叶子名，自注意力 + 交叉注意力全挂；
+    - 带点模式 ``["attn2.to_q", "attn2.to_v"]``：完整模块名后缀匹配，
+      仅挂 cross-attention（挂点数减半）。
 
     Args:
         dit: 冻结的 TripoSG DiT。
         rank: LoRA 秩。
-        target_modules: 目标模块名列表（如 ["to_q", "to_v"]）。
+        target_modules: 目标模块名列表（裸名 ``["to_q", "to_v"]`` 或带点
+            后缀模式 ``["attn2.to_q", "attn2.to_v"]``）。
         alpha: LoRA 缩放系数，默认取 rank（scaling=1）。
 
     Returns:
@@ -199,7 +238,7 @@ def inject_lora(
         if not isinstance(module, nn.Linear):
             continue
         leaf = name.rsplit(".", 1)[-1] if "." in name else name
-        if not _match_target(leaf, target_modules):
+        if not _match_target(name, target_modules):
             continue
         # 找到父模块并原地替换属性
         parent = dit
@@ -228,13 +267,61 @@ def lora_state_dict(adapters: Dict[str, LoRALinear]) -> Dict[str, Tensor]:
 
 
 def load_lora_state_dict(adapters: Dict[str, LoRALinear], state: Dict[str, Tensor]) -> None:
-    """把 checkpoint 中的 LoRA 权重写回适配器。"""
+    """把 checkpoint 中的 LoRA 权重写回适配器。
+
+    双向校验：适配器缺键会 KeyError（原有行为）；权重里存在未被任何已挂载
+    适配器消费的键同样 KeyError（防止训练 84 挂点权重被推理 42 挂点加载时
+    attn1 增量被静默丢弃）。
+    """
     for name, adapter in adapters.items():
         key_a, key_b = f"{name}.lora_A", f"{name}.lora_B"
         if key_a not in state or key_b not in state:
             raise KeyError(f"checkpoint 缺少 LoRA 权重: {key_a} / {key_b}")
         adapter.lora_A.data.copy_(state[key_a].to(adapter.lora_A.device))
         adapter.lora_B.data.copy_(state[key_b].to(adapter.lora_B.device))
+
+    consumed = {
+        f"{name}.{suffix}" for name in adapters for suffix in ("lora_A", "lora_B")
+    }
+    unconsumed = [key for key in state if key not in consumed]
+    if unconsumed:
+        preview = ", ".join(unconsumed[:4])
+        raise KeyError(
+            f"LoRA 权重含 {len(unconsumed)} 个未被任何已挂载适配器消费的键"
+            f"（前几个: {preview} ...）。通常是挂点数少于训练侧（如 v4 的 42 挂点"
+            "加载旧 84 挂点权重），请核对 lora_target_modules 与训练配置一致"
+        )
+
+
+# 优化器默认 weight decay（历史硬编码值；lora_B 单独分组时 lora_A 沿用该值）
+DEFAULT_WEIGHT_DECAY = 0.01
+
+
+def build_lora_param_groups(
+    adapters: Dict[str, LoRALinear], lora_b_weight_decay: float = 0.0
+) -> Any:
+    """构造优化器参数（B 矩阵锚：lora_B 可单独施加 weight_decay）。
+
+    - ``lora_b_weight_decay <= 0.0``（配置缺省）：返回与历史行为一致的扁平
+      参数列表（逐适配器 A / B 交错排列，单一默认参数组），训练逐位不变；
+    - 否则返回两个参数组：lora_B 组施加 ``lora_b_weight_decay``（把 B 矩阵
+      锚向零，抑制 LoRA 增量幅度失控），lora_A 组保持 ``DEFAULT_WEIGHT_DECAY``。
+    """
+    if float(lora_b_weight_decay) <= 0.0:
+        return [
+            param
+            for adapter in adapters.values()
+            for param in (adapter.lora_A, adapter.lora_B)
+        ]
+    group_b = {
+        "params": [adapter.lora_B for adapter in adapters.values()],
+        "weight_decay": float(lora_b_weight_decay),
+    }
+    group_a = {
+        "params": [adapter.lora_A for adapter in adapters.values()],
+        "weight_decay": DEFAULT_WEIGHT_DECAY,
+    }
+    return [group_b, group_a]
 
 
 # ====================================================================== #
@@ -456,13 +543,38 @@ class LatentCacheDataset(Dataset):
             raise RuntimeError(f"latent 缓存为空: {cache_dir}")
         self._shard_cache: Dict[str, Dict[str, Any]] = {}
 
-        # 探测首个 shard 的 image_embeds 序列长度（缺失时用默认值造零嵌入）
-        first_shard = self._get_shard(self.index[0][0])
-        embeds = first_shard.get("image_embeds", None)
-        if embeds is not None:
-            self.cond_num_tokens = int(embeds.shape[1])
-            self.cond_dim = int(embeds.shape[2])
+        # 扫描全部 shard 的 image_embeds token 维（混装护栏）：不同口径
+        # （如 1370 与 257）混在同一缓存里会在 DataLoader collate 时
+        # 训练中途崩溃，这里初始化时全量扫描、发现不一致立即报错。
+        # shard 不大，逐个加载可接受；扫完释放进程缓存避免常驻内存
+        shard_names: List[str] = []
+        for shard_name, _ in self.index:
+            if shard_name not in shard_names:
+                shard_names.append(shard_name)
+        embed_shapes: Dict[Tuple[int, int], List[str]] = {}
+        for shard_name in shard_names:
+            embeds = self._get_shard(shard_name).get("image_embeds", None)
+            if embeds is None:
+                continue  # 无 image_embeds 的 shard 按零嵌入处理，不参与形状校验
+            embed_shapes.setdefault(
+                (int(embeds.shape[1]), int(embeds.shape[2])), []
+            ).append(shard_name)
+        self._shard_cache.clear()
+        if len(embed_shapes) > 1:
+            detail = "; ".join(
+                f"{tokens}x{dim} token: {names}"
+                for (tokens, dim), names in embed_shapes.items()
+            )
+            raise RuntimeError(
+                f"latent 缓存 {cache_dir} 的 image_embeds 形状混装：{detail}。"
+                "不同 token 口径（如 1370 / 257）禁止混入同一训练缓存，"
+                "请重建缓存（scripts/precompute_latents.py / precompute_objaverse_stream.py）"
+            )
+        if embed_shapes:
+            # 形状已验证全局一致，任取一组作为条件嵌入形状
+            (self.cond_num_tokens, self.cond_dim) = next(iter(embed_shapes))
         else:
+            # 整个缓存都没有 image_embeds：用默认值造零嵌入
             self.cond_num_tokens = DIT_COND_NUM_TOKENS
             self.cond_dim = DIT_COND_DIM
 
@@ -535,6 +647,57 @@ def _dataset_uid_weighted(
     return uid in dataset.critic_weights
 
 
+def split_validation_batches(
+    dataset: LatentCacheDataset,
+    num_samples: int,
+    batch_size: int,
+    min_train_samples: int = 1,
+) -> List[Dict[str, Tensor]]:
+    """从 latent 缓存尾部切出 held-out 验证集（就地从训练索引中移除）。
+
+    ``dataset.index`` 按 shard 顺序展平，取末尾 ``num_samples`` 条等于取最后一个
+    shard 的尾部样本；预取成 CPU 张量 batch 列表后从训练索引删除，保证验证
+    样本永不参与训练。必须在构建 DataLoader **之前**调用，否则 worker 进程拿到的
+    是切分前的索引副本。
+
+    Args:
+        dataset: latent 缓存数据集（就地修改 ``index``）。
+        num_samples: 验证样本数；<= 0 时不切分。
+        batch_size: 验证 batch 大小。
+        min_train_samples: 切分后至少需留给训练的样本数（传训练 batch_size），
+            不够时自动缩小甚至放弃切分。
+
+    Returns:
+        验证 batch 列表，每项为 ``{'latent': [B, N, 64], 'image_embeds': [B, S, D]}``
+        （fp16 常驻内存，与 latent 缓存本身的存储精度一致，前向时再转 fp32）；
+        未切分时返回空列表。
+    """
+    total = len(dataset.index)
+    num_samples = min(int(num_samples), max(total - max(1, int(min_train_samples)), 0))
+    if num_samples <= 0:
+        return []
+
+    start_index = total - num_samples
+    items = [dataset[start_index + i] for i in range(num_samples)]
+    del dataset.index[start_index:]
+    # 预取会把尾部 shard 读进进程缓存，取完立即释放内存
+    dataset._shard_cache.clear()
+
+    batch_size = max(1, int(batch_size))
+    batches: List[Dict[str, Tensor]] = []
+    for start in range(0, num_samples, batch_size):
+        chunk = items[start : start + batch_size]
+        batches.append(
+            {
+                "latent": torch.stack([item["latent"] for item in chunk]).half(),
+                "image_embeds": torch.stack(
+                    [item["image_embeds"] for item in chunk]
+                ).half(),
+            }
+        )
+    return batches
+
+
 # ====================================================================== #
 # LR 调度器（cosine + warmup）
 # ====================================================================== #
@@ -586,6 +749,64 @@ class LoRAEMA:
 # ====================================================================== #
 # 训练步：rectified flow
 # ====================================================================== #
+def parse_condition_dropout(train_cfg: Dict[str, Any]) -> float:
+    """读取 ``training.condition_dropout``（默认 0.0 = 不启用）并校验区间。
+
+    合法值必须在 [0, 1]；越界或 NaN 一律 ValueError（NaN 的比较恒为 False，
+    会被同一条件拦下），防止坏配置静默进入训练循环。
+    """
+    value = float(train_cfg.get("condition_dropout", 0.0))
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(
+            f"training.condition_dropout 必须在 [0, 1]，实际 {value}"
+        )
+    return value
+
+
+def parse_lora_b_weight_decay(train_cfg: Dict[str, Any]) -> float:
+    """读取 ``training.lora_b_weight_decay``（默认 0.0 = 关闭）并校验。
+
+    必须为非负有限值；负值 / NaN / inf 一律 ValueError，防止坏配置静默进入
+    优化器。0.0 = 与历史单一参数组行为逐位一致（由 build_lora_param_groups 保证）。
+    """
+    value = float(train_cfg.get("lora_b_weight_decay", 0.0))
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            f"training.lora_b_weight_decay 必须为非负有限值，实际 {value}"
+        )
+    return value
+
+
+def apply_condition_dropout(
+    cond: Optional[Tensor], p: float, generator: Optional[torch.Generator] = None
+) -> Optional[Tensor]:
+    """训练期 condition dropout：逐样本独立以概率 p 把整条 image_embeds 置零（纯函数）。
+
+    与官方 CFG 空分支一致——用 ``zeros_like`` 置零（保持 dtype / 形状），
+    让模型把「零嵌入 == 无条件」学进分布内；否则推理 CFG 的 uncond 分支
+    对 LoRA 属分布外，高 cfg_scale 外推会放大损坏。
+
+    Args:
+        cond: 图像条件嵌入 [B, S, D]；None 或 p <= 0 时原样返回（零开销路径）。
+        p: 逐样本置零概率（0~1）。
+        generator: 可选随机数生成器（测试可复现用）；None 用全局 RNG。
+            若非 None，其 device 必须与 ``cond.device`` 一致（torch.rand
+            要求生成器与目标设备匹配，否则抛 RuntimeError）。
+
+    Returns:
+        置零后的条件张量（不修改输入本身）；无需 dropout 时返回原对象。
+    """
+    if cond is None or p <= 0.0:
+        return cond
+    batch_size = cond.shape[0]
+    mask = torch.rand(batch_size, device=cond.device, generator=generator) < float(p)
+    if not mask.any():
+        return cond
+    # 掩码广播到 [B, 1, ..., 1]：被选中的样本整条置零，其余逐元素不变
+    shape = (batch_size,) + (1,) * (cond.dim() - 1)
+    return torch.where(mask.view(*shape), torch.zeros_like(cond), cond)
+
+
 def train_step(
     dit: nn.Module,
     latents: Tensor,
@@ -646,6 +867,82 @@ def train_step(
     return loss
 
 
+@torch.no_grad()
+def compute_validation_loss(
+    dit: nn.Module,
+    val_batches: List[Dict[str, Tensor]],
+    use_bf16: bool,
+    timestep_scale: float,
+    device: torch.device,
+    seed: int = VAL_NOISE_SEED,
+) -> Optional[float]:
+    """在 held-out 样本上计算验证 MSE（无梯度）。
+
+    前向与 ``train_step`` 完全一致（rectified flow 加噪 + 速度场 MSE），但：
+
+    1. 噪声与时间步由固定种子的 ``torch.Generator`` 产生，每次验证用同一批
+       噪声，不同步数的验证损失可直接对比，同时不污染全局 RNG（训练可复现）；
+    2. 不做 Critic 样本加权，始终是纯均值 MSE（作为干净的泛化指标）；
+    3. 用当前训练权重（非 EMA），便于与 ``train/loss`` 直接对比判断过拟合。
+
+    Args:
+        dit: 含 LoRA 的 DiT（调用前后的 train / eval 模式会自动恢复）。
+        val_batches: ``split_validation_batches`` 的输出；空列表直接返回 None。
+        use_bf16: 是否启用 bf16 autocast（与训练一致）。
+        timestep_scale: 时间步缩放（与训练一致）。
+        device: 计算设备。
+        seed: 噪声种子。
+
+    Returns:
+        平均验证 MSE；验证集为空或计算失败时返回 None（不中断训练）。
+    """
+    if not val_batches:
+        return None
+
+    was_training = dit.training
+    dit.eval()
+    total_loss = 0.0
+    count = 0
+    try:
+        generator = torch.Generator(device=device).manual_seed(int(seed))
+        for batch in val_batches:
+            latents = batch["latent"].to(device, non_blocking=True).float()
+            cond = batch.get("image_embeds", None)
+            if cond is not None:
+                cond = cond.to(device, non_blocking=True).float()
+
+            noise = torch.randn(
+                latents.shape, generator=generator, device=device, dtype=latents.dtype
+            )
+            t = torch.rand(
+                latents.shape[0], generator=generator, device=device, dtype=latents.dtype
+            )
+            t_expand = t.view(latents.shape[0], *([1] * (latents.dim() - 1)))
+            x_t = (1.0 - t_expand) * latents + t_expand * noise
+            velocity_target = noise - latents
+
+            ctx = (
+                torch.cuda.amp.autocast(dtype=torch.bfloat16)
+                if use_bf16 and device.type == "cuda"
+                else torch.autocast("cpu", enabled=False)
+            )
+            with ctx:
+                velocity_pred = forward_dit(dit, x_t, t * timestep_scale, cond)
+            # 按样本数加权：num_val_samples 不整除 val_batch_size 时尾部小
+            # batch 不能与大 batch 等权，否则验证指标有偏
+            total_loss += float(
+                F.mse_loss(velocity_pred.float(), velocity_target.float()).item()
+            ) * latents.shape[0]
+            count += latents.shape[0]
+    except Exception as exc:  # 验证只是观测指标，失败绝不能中断训练
+        LOGGER.warning("[验证] 计算失败（%s），跳过本次验证", exc)
+        return None
+    finally:
+        if was_training:
+            dit.train()
+    return total_loss / max(count, 1)
+
+
 # ====================================================================== #
 # 评估：Euler 采样 -> VAE 解码 -> mesh -> 多视角渲染
 # ====================================================================== #
@@ -657,16 +954,34 @@ def sample_latent_euler(
     num_steps: int = EVAL_NUM_STEPS,
     timestep_scale: float = 1000.0,
     cond: Optional[Tensor] = None,
+    guidance_scale: float = EVAL_GUIDANCE_SCALE,
 ) -> Tensor:
     """用训练好的速度场从纯噪声做 Euler 反向积分，得到采样 latent。
 
     积分方向 t: 1 -> 0（x_1 = noise，x_0 = 数据），步长 dt = -1/num_steps。
+
+    ``guidance_scale > 1.0`` 且 ``cond`` 非 None 时启用 classifier-free
+    guidance（与 TripoSG 官方推理一致）：每步用零嵌入算无条件速度
+    ``v_uncond``，用真实条件算 ``v_cond``，组合为
+    ``v = v_uncond + guidance_scale * (v_cond - v_uncond)``。
+    ``guidance_scale <= 1.0`` 或无条件（含全零条件回退）时退化为单分支采样，
+    避免双倍前向开销。
+    注意：CFG 只是评估/推理期采样技巧，不影响训练目标。
     """
     x = torch.randn((1, *latent_shape), device=device)
     dt = 1.0 / float(num_steps)
+    # cond 全零时（无 image_embeds 的回退场景）v_cond == v_uncond，
+    # CFG 双前向等价于无引导却多付一倍开销，直接退化为单分支
+    use_cfg = cond is not None and guidance_scale > 1.0 and bool(cond.abs().any())
+    cond_uncond = torch.zeros_like(cond) if use_cfg else None
     for step in range(num_steps):
         t = torch.full((1,), 1.0 - step * dt, device=device)
-        velocity = forward_dit(dit, x, t * timestep_scale, cond)
+        if use_cfg:
+            v_cond = forward_dit(dit, x, t * timestep_scale, cond)
+            v_uncond = forward_dit(dit, x, t * timestep_scale, cond_uncond)
+            velocity = v_uncond + guidance_scale * (v_cond - v_uncond)
+        else:
+            velocity = forward_dit(dit, x, t * timestep_scale, cond)
         x = x - dt * velocity
     return x.squeeze(0)
 
@@ -749,6 +1064,166 @@ def decode_latent_to_mesh(
     )
 
 
+def _shard_caption(shard: Dict[str, Any], inner_idx: int) -> str:
+    """读取 shard 内某条样本的 caption（缺失时返回空串）。"""
+    captions = shard.get("captions", [])
+    return str(captions[inner_idx]) if inner_idx < len(captions) else ""
+
+
+def _sample_eval_conditions(
+    dataset: LatentCacheDataset, num_samples: int, device: torch.device
+) -> Tuple[List[Tensor], List[str]]:
+    """从 latent cache 随机抽取评估用条件嵌入及其 caption。
+
+    优先取 shard 中真实的 DINOv2 ``image_embeds``（本轮为条件训练，
+    真实条件采样预览才有意义）；仅当整个 cache 都没有 image_embeds 时
+    才回退零嵌入（与官方 CFG 空分支一致，避免 cross-attn 形状错）。
+
+    Returns:
+        ``(条件嵌入列表, caption 列表)``，两者长度一致且一一对应；caption
+        供 CLIP Score 使用，缺失时为空串（对应样本不参与 CLIP 打分）。
+    """
+    conds: List[Tensor] = []
+    captions: List[str] = []
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    for idx in indices:
+        if len(conds) >= num_samples:
+            break
+        shard_name, inner_idx = dataset.index[idx]
+        shard = dataset._get_shard(shard_name)
+        embeds = shard.get("image_embeds", None)
+        if embeds is not None:
+            conds.append(embeds[inner_idx].float().unsqueeze(0).to(device))
+            captions.append(_shard_caption(shard, inner_idx))
+    if conds:
+        return conds, captions
+    zero = torch.zeros((1, dataset.cond_num_tokens, dataset.cond_dim), device=device)
+    captions = [
+        _shard_caption(dataset._get_shard(dataset.index[idx][0]), dataset.index[idx][1])
+        for idx in indices[:num_samples]
+    ]
+    return [zero.clone() for _ in range(num_samples)], captions
+
+
+def _build_renderer_from_cfg(render_cfg: Dict[str, Any], device: torch.device) -> Any:
+    """按 ``rendering`` 配置段构建多视角渲染器（缺失字段回落默认值）。
+
+    与 ``inference.build_renderer`` 口径一致：``azimuth_strategy="fixed"``
+    （等间距环绕视角，预览图与打分均可复现）。
+
+    Args:
+        render_cfg: ``rendering`` 配置段；None / 空 dict 时全部用默认值
+            （image_size=256, num_views=4, camera_distance=2.5,
+            elevation_range=[-30, 30]）。
+        device: 渲染设备。
+
+    Raises:
+        Exception: nvdiffrast / CUDA 不可用时由 ``MultiViewRenderer`` 抛出，
+            由调用方捕获并跳过评估。
+    """
+    from rendering.multi_view_render import MultiViewRenderer
+
+    render_cfg = dict(render_cfg or {})
+    elevation = list(render_cfg.get("elevation_range", (-30.0, 30.0)))
+    if len(elevation) != 2:
+        LOGGER.warning("[评估] rendering.elevation_range 应为 [min, max]，回落 [-30, 30]")
+        elevation = [-30.0, 30.0]
+    return MultiViewRenderer(
+        image_size=int(render_cfg.get("image_size", 256)),
+        num_views=int(render_cfg.get("num_views", 4)),
+        camera_distance=float(render_cfg.get("camera_distance", 2.5)),
+        elevation_range=(float(elevation[0]), float(elevation[1])),
+        azimuth_strategy="fixed",
+        device=str(device),
+    )
+
+
+def _build_eval_clip(config: Dict[str, Any], device: torch.device) -> Optional[Any]:
+    """构建评估用的冻结 CLIP 编码器（进程内缓存），不可用时返回 None。
+
+    ``evaluation.clip_model_name`` 为 null / 空串时视为主动关闭；导入或加载失败
+    时只警告一次并缓存 None，之后每轮评估静默跳过 CLIP 相关指标。
+    """
+    if "clip" in _EVAL_MODEL_CACHE:
+        return _EVAL_MODEL_CACHE["clip"]
+
+    eval_cfg = dict(config.get("evaluation", {}) or {})
+    model_name = eval_cfg.get("clip_model_name", "ViT-B/32")
+    encoder: Optional[Any] = None
+    if model_name:
+        try:
+            from vlm.clip_encoder import CLIPEncoder
+
+            encoder = CLIPEncoder(
+                model_name=str(model_name),
+                device=str(device),
+                input_range="zero_one",  # 渲染器输出已在 [0, 1]
+                pretrained=str(eval_cfg.get("clip_pretrained", "openai")),
+            )
+            LOGGER.info("[评估] CLIP 已加载（%s），将记录 eval/clip_score", model_name)
+        except Exception as exc:  # CLIP 为可选依赖，缺失不影响训练
+            LOGGER.warning("[评估] CLIP 不可用（%s），跳过 clip_score / critic_score", exc)
+            encoder = None
+    _EVAL_MODEL_CACHE["clip"] = encoder
+    return encoder
+
+
+def _build_eval_critic(
+    config: Dict[str, Any], device: torch.device
+) -> Optional[Tuple[Any, int, Dict[str, Any]]]:
+    """加载评估用的 SemanticCritic（进程内缓存），不可用时返回 None。
+
+    权重取 ``evaluation.critic_checkpoint``（``train.py`` 产出的 GAN checkpoint，
+    含 ``state['critic']``），复用 ``inference.build_critic`` 保证结构与训练一致。
+    注意它与 ``training.critic_weights_path``（uid -> 权重 JSON）不是同一个文件。
+
+    Returns:
+        ``(critic, geo_dim, critic 训练时的 rendering 配置)``；
+        未配置 / 加载失败时返回 None。
+    """
+    if "critic" in _EVAL_MODEL_CACHE:
+        return _EVAL_MODEL_CACHE["critic"]
+
+    checkpoint = (config.get("evaluation", {}) or {}).get("critic_checkpoint")
+    bundle: Optional[Tuple[Any, int, Dict[str, Any]]] = None
+    if checkpoint:
+        try:
+            from inference import build_critic
+
+            critic, geo_dim, critic_render_cfg = build_critic(str(checkpoint), device)
+            bundle = (critic, int(geo_dim), dict(critic_render_cfg or {}))
+            LOGGER.info(
+                "[评估] SemanticCritic 已加载（%s），将记录 eval/critic_score", checkpoint
+            )
+        except Exception as exc:  # Critic 为可选指标，加载失败不影响训练
+            LOGGER.warning("[评估] Critic 不可用（%s），跳过 critic_score", exc)
+            bundle = None
+    _EVAL_MODEL_CACHE["critic"] = bundle
+    return bundle
+
+
+@torch.no_grad()
+def _clip_score_for_views(clip_encoder: Any, views: Tensor, caption: str) -> float:
+    """单个样本的 CLIP Score：逐视角图文余弦相似度的均值。
+
+    口径与 ``evaluate.py:clip_score_batch`` 一致：原始余弦相似度（不做 ×100
+    缩放），编码 ``augment=False`` 保证确定性。
+
+    Args:
+        clip_encoder: CLIPEncoder 实例。
+        views: [N_views, 3, H, W] 渲染图，范围 [0, 1]。
+        caption: 该样本的文本描述。
+
+    Returns:
+        均值余弦相似度。
+    """
+    image_features = clip_encoder.encode_images(views, augment=False)  # [N, D]
+    text_features = clip_encoder.encode_text([caption])  # [1, D]
+    text_features = text_features.expand(image_features.shape[0], -1)
+    return float(clip_encoder.paired_similarity(image_features, text_features).mean().item())
+
+
 @torch.no_grad()
 def run_evaluation(
     iteration: int,
@@ -760,10 +1235,23 @@ def run_evaluation(
     config: Dict[str, Any],
     device: torch.device,
     writer: Optional[Any],
-) -> None:
-    """定期评估：EMA 权重采样 latent -> 解码 mesh -> 渲染预览图。
+) -> Optional[Dict[str, float]]:
+    """定期评估：EMA 权重采样 latent -> 解码 mesh -> 渲染预览图 + 附加指标。
 
-    评估失败只记警告，绝不中断训练。
+    渲染参数（image_size / num_views / camera_distance / elevation_range）全部
+    从配置 ``rendering`` 段读取，缺失时回落原有默认值。预览图之外，在对应
+    模块可用时额外写入两个指标：
+
+    - ``eval/clip_score``：渲染图与样本 caption 的 CLIP 图文余弦相似度；
+    - ``eval/critic_score``：SemanticCritic plausibility ∈ [0, 1]，打分渲染器
+      按 Critic 训练时的 rendering 配置单独构建（与 ``inference.py`` 对齐）。
+
+    评估（含两个附加指标）失败只记警告，绝不中断训练。
+
+    Returns:
+        本轮 eval 均值分数字典（键 ``clip_score`` / ``critic_score``，仅在
+        对应指标有有效样本时存在）；评估未能进行（渲染器 / VAE 不可用）
+        时返回 None。供 best checkpoint 跟踪计算复合分。
     """
     output_dir = config.get("logging", {}).get("output_dir", "./outputs/diffusion_train")
     eval_dir = os.path.join(output_dir, "eval")
@@ -771,13 +1259,26 @@ def run_evaluation(
     timestep_scale = float(train_cfg.get("timestep_scale", 1000.0))
 
     try:
-        from rendering.multi_view_render import MultiViewRenderer
         from utils.visualize import save_image, tile_images
 
-        renderer = MultiViewRenderer(num_views=4, azimuth_strategy="fixed", device=str(device))
+        # 渲染参数一律读配置；旧配置无 rendering 段时等价于原来的硬编码默认值
+        renderer = _build_renderer_from_cfg(config.get("rendering", {}), device)
     except Exception as exc:  # 渲染器依赖 nvdiffrast/CUDA，不可用时跳过
         LOGGER.warning("[评估] 渲染器构建失败（%s），跳过本次评估", exc)
         return
+
+    # ---- 附加指标依赖的模型：任一不可用时为 None，对应指标静默跳过 ---- #
+    clip_encoder = _build_eval_clip(config, device)
+    # Critic 的语义输入来自 CLIP，CLIP 不可用时 Critic 打分也无法进行
+    critic_bundle = _build_eval_critic(config, device) if clip_encoder is not None else None
+    critic_renderer: Optional[Any] = None
+    if critic_bundle is not None:
+        try:
+            # Critic 的预处理必须对齐其训练时的渲染配置，因此单独建渲染器
+            critic_renderer = _build_renderer_from_cfg(critic_bundle[2], device)
+        except Exception as exc:
+            LOGGER.warning("[评估] Critic 打分渲染器构建失败（%s），跳过 critic_score", exc)
+            critic_bundle = None
 
     # 用 EMA 权重评估（评估后恢复训练权重）
     backup = ema.apply(adapters)
@@ -788,29 +1289,69 @@ def run_evaluation(
             shard = dataset._get_shard(dataset.index[0][0])
             latent_shape = tuple(shard["latents"].shape[1:])
 
-        # 采样条件：零嵌入（与官方 CFG 空分支一致）。不能传 None ——
-        # diffusers Attention 在 encoder_hidden_states=None 时会拿 2048 维的
-        # hidden_states 当 cross-attn KV，撞上 to_k/to_v 的 1024 维投影报形状错
-        cond = torch.zeros(
-            (1, dataset.cond_num_tokens, dataset.cond_dim), device=device
-        )
+        # 采样条件：优先从 cache 随机抽真实 DINOv2 image_embeds（本轮是
+        # 条件训练，零条件采样只会出黑图）；cache 无 image_embeds 时才回退
+        # 零嵌入（与官方 CFG 空分支一致）。不能传 None —— diffusers Attention
+        # 在 encoder_hidden_states=None 时会拿 2048 维的 hidden_states 当
+        # cross-attn KV，撞上 to_k/to_v 的 1024 维投影报形状错
+        conds, captions = _sample_eval_conditions(dataset, EVAL_NUM_SAMPLES, device)
+
+        # 评估前清理显存缓存：frozen DiT + VAE + AdamW 状态仍常驻显存，
+        # 高八叉树深度解码 + CFG 双前向会抬高峰值，提前清缓存降低 OOM 概率
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if vae is None:
             LOGGER.warning("[评估] VAE 不可用，跳过 mesh 解码预览")
             return
 
         tiles = []
+        clip_scores: List[float] = []
+        critic_scores: List[float] = []
         for i in range(EVAL_NUM_SAMPLES):
             try:
                 latent = sample_latent_euler(
-                    dit, latent_shape, device, EVAL_NUM_STEPS, timestep_scale, cond
+                    dit,
+                    latent_shape,
+                    device,
+                    EVAL_NUM_STEPS,
+                    timestep_scale,
+                    conds[i % len(conds)],
+                    guidance_scale=EVAL_GUIDANCE_SCALE,
                 )
                 vertices, faces = decode_latent_to_mesh(vae, latent)
-                out = renderer.render(vertices.unsqueeze(0).to(device), faces.to(device))
-                tiles.append(out["images"][0].cpu())  # [N_views, 3, H, W]
+                verts = vertices.unsqueeze(0).to(device)
+                tris = faces.to(device)
+                out = renderer.render(verts, tris)
+                views = out["images"][0]  # [N_views, 3, H, W]
+                tiles.append(views.cpu())
             except Exception as exc:
                 LOGGER.warning("[评估] 样本 %d 生成失败（%s），跳过", i, exc)
                 continue
+
+            # ---- 附加指标：单个样本打分失败不影响其他样本与预览图 ---- #
+            caption = captions[i % len(captions)] if captions else ""
+            if clip_encoder is not None and caption:
+                try:
+                    clip_scores.append(_clip_score_for_views(clip_encoder, views, caption))
+                except Exception as exc:
+                    LOGGER.warning("[评估] 样本 %d CLIP 打分失败（%s），跳过", i, exc)
+            if critic_bundle is not None and critic_renderer is not None:
+                try:
+                    from inference import critic_score_for_mesh
+
+                    critic_scores.append(
+                        critic_score_for_mesh(
+                            critic_bundle[0],
+                            critic_bundle[1],
+                            clip_encoder,
+                            critic_renderer,
+                            verts,
+                            tris,
+                        )
+                    )
+                except Exception as exc:
+                    LOGGER.warning("[评估] 样本 %d Critic 打分失败（%s），跳过", i, exc)
 
         if tiles:
             grid = tile_images(torch.cat(tiles, dim=0), ncols=8)
@@ -822,6 +1363,18 @@ def run_evaluation(
                 if grid_np.ndim == 2:
                     grid_np = np.stack([grid_np] * 3, axis=-1)
                 writer.add_image("eval/samples", grid_np, iteration, dataformats="HWC")
+
+        # ---- 附加指标汇总（无有效样本的指标不写日志）---- #
+        scores: Dict[str, float] = {}
+        for key, values in (("clip_score", clip_scores), ("critic_score", critic_scores)):
+            if not values:
+                continue
+            mean_value = sum(values) / len(values)
+            scores[key] = mean_value
+            LOGGER.info("[评估] %s %.4f（%d 个样本）", key, mean_value, len(values))
+            if writer is not None:
+                writer.add_scalar(f"eval/{key}", mean_value, iteration)
+        return scores
     finally:
         LoRAEMA.restore(adapters, backup)
         dit.train()
@@ -881,6 +1434,43 @@ def load_checkpoint(
     return start_iteration
 
 
+class BestCheckpointer:
+    """按生成质量跟踪 best checkpoint（复合分 = eval clip × critic）。
+
+    复合分取训练内 eval 的 ``clip_score`` 均值（CLIP 图文余弦相似度，
+    有界于 [-1, 1]）与 ``critic_score`` 均值（SemanticCritic plausibility，
+    有界于 [0, 1]）的**原始乘积**，不做归一化：两项指标本身有界且方向一致
+    （越大越好），乘积对二者均单调，任一指标退化都会拉低复合分；归一化
+    反而会引入对历史分数序列的依赖，不可复现。
+
+    仅当两项指标都有效时才参与 best 竞争；复合分严格变高才刷新。
+    """
+
+    def __init__(self) -> None:
+        self.best_composite: Optional[float] = None
+        self.best_iteration: Optional[int] = None
+
+    def offer(self, iteration: int, clip_score: float, critic_score: float) -> bool:
+        """提交一次 eval 分数；复合分严格更高时刷新 best 并返回 True。
+
+        复合分为 NaN / inf（任一指标非有限）时打 warning 并直接 return False，
+        不参与 best 竞争，防止脏分数污染 best 记录。
+        """
+        composite = float(clip_score) * float(critic_score)
+        if not math.isfinite(composite):
+            LOGGER.warning(
+                "[best] eval 分数含非有限值（clip=%s, critic=%s），跳过本轮 best 竞争",
+                clip_score,
+                critic_score,
+            )
+            return False
+        if self.best_composite is None or composite > self.best_composite:
+            self.best_composite = composite
+            self.best_iteration = int(iteration)
+            return True
+        return False
+
+
 # ====================================================================== #
 # 主流程
 # ====================================================================== #
@@ -918,9 +1508,24 @@ def main() -> None:
     accumulation_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
     timestep_scale = float(train_cfg.get("timestep_scale", 1000.0))
     learning_rate = float(train_cfg.get("learning_rate", 1e-4))
+    # Condition dropout：训练期逐样本以概率 p 把 image_embeds 置零，让 CFG 的
+    # uncond 零嵌入分支留在分布内；0.0 = 不启用，训练行为与原来完全一致。
+    # 区间校验（含 NaN）在 parse_condition_dropout 内完成
+    condition_dropout = parse_condition_dropout(train_cfg)
+
+    # 附加评估配置（旧配置缺失 evaluation 段时全部回落默认值；
+    # num_val_samples 默认 0 = 不切验证集，训练行为与原来完全一致）
+    eval_cfg = config.get("evaluation", {}) or {}
+    val_interval = int(eval_cfg.get("interval", 500))
+    num_val_samples = int(eval_cfg.get("num_val_samples", 0))
+    val_batch_size = int(eval_cfg.get("val_batch_size", 4))
 
     device = torch.device(args.device)
     LOGGER.info("扩散 LoRA 微调启动：device=%s, bf16=%s", device, use_bf16)
+    LOGGER.info(
+        "condition_dropout=%s",
+        condition_dropout if condition_dropout > 0.0 else "0.0（未启用）",
+    )
 
     # ---- 模型 / 优化器 / 调度器 ----
     dit, adapters, vae = build_dit_with_lora(config, device)
@@ -931,7 +1536,15 @@ def main() -> None:
     lora_params = [
         param for adapter in adapters.values() for param in (adapter.lora_A, adapter.lora_B)
     ]
-    optimizer = torch.optim.AdamW(lora_params, lr=learning_rate, weight_decay=0.01)
+    # B 矩阵锚：lora_B 单独一组施加 training.lora_b_weight_decay（缺省 0.0 时
+    # 退化为原有单一参数组，训练行为逐位不变）；梯度裁剪仍对全量 LoRA 参数
+    lora_b_weight_decay = parse_lora_b_weight_decay(train_cfg)
+    if lora_b_weight_decay > 0.0:
+        LOGGER.info("B 矩阵锚已启用：lora_B weight_decay=%.4g", lora_b_weight_decay)
+    param_groups = build_lora_param_groups(adapters, lora_b_weight_decay)
+    optimizer = torch.optim.AdamW(
+        param_groups, lr=learning_rate, weight_decay=DEFAULT_WEIGHT_DECAY
+    )
     # 调度器按实际优化器步数构建（每 accumulation_steps 个迭代才 step 一次），
     # 与训练循环中 scheduler.step() 的调用频率保持一致
     total_optim_steps = max(1, max_iterations // accumulation_steps)
@@ -952,9 +1565,30 @@ def main() -> None:
             f"数据集样本数 ({len(dataset)}) 小于 batch_size ({batch_size})，"
             f"请减小 batch_size 或增大缓存数据量"
         )
+
+    # ---- 可选 held-out 验证集（必须在建 DataLoader 之前切分，否则 worker
+    # 拿到的是切分前的索引）；num_val_samples=0 时训练集与原来完全一致 ----
+    val_batches = split_validation_batches(
+        dataset, num_val_samples, val_batch_size, min_train_samples=batch_size
+    )
+    if val_batches:
+        num_held_out = sum(item["latent"].shape[0] for item in val_batches)
+        LOGGER.info(
+            "验证集：%d 个 held-out 样本（%d 个 batch），每 %d 步计算一次 MSE",
+            num_held_out,
+            len(val_batches),
+            val_interval,
+        )
+    elif num_val_samples > 0:
+        LOGGER.warning(
+            "样本数不足以切出 %d 个验证样本（需留至少 %d 个给训练），已跳过验证集切分",
+            num_val_samples,
+            batch_size,
+        )
+
     loader = build_dataloader(config, dataset)
     batches = infinite_batches(loader)
-    LOGGER.info("latent 数据集：%d 个样本（%s）", len(dataset), cache_dir)
+    LOGGER.info("latent 数据集：%d 个训练样本（%s）", len(dataset), cache_dir)
 
     # ---- Learned Semantic Reward 训练加权统计 ----
     if dataset.critic_weights:
@@ -992,6 +1626,14 @@ def main() -> None:
 
     # ---- 训练循环（训练步内不做任何渲染 / VAE 调用）----
     optimizer.zero_grad(set_to_none=True)
+    # best checkpoint 跟踪（配方 4）：training.save_best_checkpoint 显式开启才生效，
+    # 旧配置缺省该字段时不产生任何新行为；复合分 = eval clip × critic
+    # （未归一化，见 BestCheckpointer）；断点续训时不恢复历史 best，
+    # 由续训后首轮达标 eval 重新竞争
+    save_best_checkpoint = bool(train_cfg.get("save_best_checkpoint", False))
+    best_checkpointer = BestCheckpointer()
+    if save_best_checkpoint:
+        LOGGER.info("best checkpoint 跟踪已启用：复合分 = eval clip × critic（未归一化）")
     loss_window: List[float] = []
     weight_window: List[float] = []
     grad_norm = 0.0
@@ -1003,6 +1645,10 @@ def main() -> None:
         cond = batch.get("image_embeds", None)
         if cond is not None:
             cond = cond.to(device, non_blocking=True)
+        # Condition dropout 仅训练分支生效（验证前向 compute_validation_loss
+        # 不经过此处）；p=0 时 if 门控短路，行为逐条不变
+        if cond is not None and condition_dropout > 0.0:
+            cond = apply_condition_dropout(cond, condition_dropout)
         # Learned Semantic Reward 训练加权：未配置 critic_weights_path 时恒为 None，行为不变
         sample_weights = None
         if dataset.critic_weights:
@@ -1054,11 +1700,69 @@ def main() -> None:
             loss_window.clear()
             weight_window.clear()
 
+        # ---- 定期验证损失（held-out MSE，与 train/loss 对照可观察过拟合）----
+        if val_batches and val_interval > 0 and (iteration + 1) % val_interval == 0:
+            val_loss = compute_validation_loss(
+                dit, val_batches, use_bf16, timestep_scale, device
+            )
+            if val_loss is not None:
+                LOGGER.info("iter %d | val_loss %.4f", iteration + 1, val_loss)
+                if writer is not None:
+                    writer.add_scalar("eval/val_loss", val_loss, iteration + 1)
+
         # ---- 定期评估 ----
         if eval_interval > 0 and (iteration + 1) % eval_interval == 0:
-            run_evaluation(
-                iteration + 1, dit, adapters, ema, vae, dataset, config, device, writer
-            )
+            # 评估是观测手段而非训练关键路径：内部仅 try/finally，异常会
+            # 逃逸出来直接中断训练，这里兜底捕获（不吞 KeyboardInterrupt）
+            eval_scores: Optional[Dict[str, float]] = None
+            try:
+                eval_scores = run_evaluation(
+                    iteration + 1, dit, adapters, ema, vae, dataset, config, device, writer
+                )
+            except Exception as exc:
+                LOGGER.warning("[评估] 本轮评估整体失败，已跳过，训练继续：%s", exc)
+
+            # ---- 按生成质量留 best checkpoint（复合分 = clip × critic）----
+            if (
+                save_best_checkpoint
+                and eval_scores
+                and "clip_score" in eval_scores
+                and "critic_score" in eval_scores
+                and best_checkpointer.offer(
+                    iteration + 1, eval_scores["clip_score"], eval_scores["critic_score"]
+                )
+            ):
+                LOGGER.info(
+                    "BEST_UPDATE | iter %d | clip %.4f | critic %.4f | composite %.6f",
+                    iteration + 1,
+                    eval_scores["clip_score"],
+                    eval_scores["critic_score"],
+                    best_checkpointer.best_composite,
+                )
+                if writer is not None:
+                    writer.add_scalar(
+                        "eval/best_composite", best_checkpointer.best_composite, iteration + 1
+                    )
+                # 与 ckpt_final.pt 相同的 save_checkpoint 结构（含 lora / ema）；
+                # 先写 .tmp 再 os.replace 原子替换，避免写一半被打断留下
+                # 损坏的 ckpt_best.pt；保存失败降级为 warning 不中断训练
+                # （与 eval 兜底策略一致）
+                best_path = os.path.join(output_dir, "ckpt_best.pt")
+                best_tmp_path = best_path + ".tmp"
+                try:
+                    save_checkpoint(
+                        best_tmp_path, adapters, ema, optimizer, scheduler, iteration + 1, config
+                    )
+                    os.replace(best_tmp_path, best_path)
+                except Exception as exc:
+                    LOGGER.warning(
+                        "[best] ckpt_best.pt 保存失败，降级跳过（训练继续）：%s", exc
+                    )
+                    if os.path.isfile(best_tmp_path):
+                        try:
+                            os.remove(best_tmp_path)
+                        except OSError:
+                            pass
 
         # ---- 定期保存 ----
         if save_interval > 0 and (iteration + 1) % save_interval == 0:
@@ -1073,6 +1777,14 @@ def main() -> None:
             )
 
     # ---- 收尾：最终 checkpoint + 导出纯 LoRA 权重（便于推理侧加载）----
+    if save_best_checkpoint and best_checkpointer.best_composite is None:
+        # best 从未产出：说明整轮没有一次 eval 同时拿到有效 clip 与 critic 分数
+        LOGGER.warning(
+            "save_best_checkpoint=true 但整轮训练未产出 ckpt_best.pt："
+            "从未出现 clip_score 与 critic_score 同时有效的评估。请检查 "
+            "evaluation.clip_model_name / evaluation.critic_checkpoint 是否可用、"
+            "VAE 解码与渲染链路是否正常（eval 日志中的警告可定位缺失环节）"
+        )
     final_path = os.path.join(output_dir, "ckpt_final.pt")
     save_checkpoint(final_path, adapters, ema, optimizer, scheduler, max_iterations, config)
     torch.save(

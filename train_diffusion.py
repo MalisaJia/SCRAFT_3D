@@ -76,10 +76,11 @@ EVAL_GUIDANCE_SCALE = 7.0
 # 真实 DiT 的 cross-attention 条件维度（DINOv2 large = 1024）
 DIT_COND_DIM = 1024
 
-# DINOv2 图像条件的 token 数：pipeline 的 feature_extractor 把图 resize 到
-# 518×518，patch_size=14 -> (518/14)^2 = 1369 patches + 1 CLS = 1370
-# （官方 CFG 空分支为 torch.zeros_like(image_embeds)，形状同 [B, 1370, 1024]）
-DIT_COND_NUM_TOKENS = 1370
+# DINOv2 图像条件的 token 数（仅作 shard 缺 image_embeds 时的兜底默认值；正常
+# 运行由数据集探测首个 shard 的实际形状）。官方 feature_extractor_dinov2 为
+# 224/center-crop，patch_size=14 -> (224/14)^2 = 256 patches + 1 CLS = 257
+# （官方 CFG 空分支为 torch.zeros_like(image_embeds)，形状同 [B, 257, 1024]）
+DIT_COND_NUM_TOKENS = 257
 
 # 每次评估渲染的样本数
 EVAL_NUM_SAMPLES = 4
@@ -184,12 +185,27 @@ _TARGET_ALIASES: Dict[str, Tuple[str, ...]] = {
 }
 
 
-def _match_target(leaf_name: str, targets: List[str]) -> bool:
-    """判断模块叶子名是否命中任一目标（含别名展开）。"""
-    expanded: List[str] = []
+def _match_target(module_name: str, targets: List[str]) -> bool:
+    """判断模块名是否命中任一目标（含别名展开）。
+
+    两种匹配模式：
+
+    - **带点目标**（如 ``"attn2.to_q"``）：对完整模块名做**后缀匹配**
+      （``module_name == target`` 或以 ``"." + target`` 结尾），用于限定
+      注意力类型，例如只给 cross-attention（attn2）挂适配器；
+    - **裸名目标**（如 ``"to_q"``）：保持历史行为不变 —— 别名展开后
+      对叶子名做相等或子串匹配。
+    """
+    leaf = module_name.rsplit(".", 1)[-1] if "." in module_name else module_name
     for target in targets:
-        expanded.extend(_TARGET_ALIASES.get(target, (target,)))
-    return any(alias == leaf_name or alias in leaf_name for alias in expanded)
+        if "." in target:
+            if module_name == target or module_name.endswith("." + target):
+                return True
+            continue
+        for alias in _TARGET_ALIASES.get(target, (target,)):
+            if alias == leaf or alias in leaf:
+                return True
+    return False
 
 
 def inject_lora(
@@ -199,12 +215,17 @@ def inject_lora(
 
     真实 TripoSG DiT（``TripoSGDiTModel``）的自注意力 / 交叉注意力投影位于
     ``blocks.{i}.attn1.{to_q,to_v}`` 与 ``blocks.{i}.attn2.{to_q,to_v}``
-    （diffusers ``Attention`` 模块），目标名推荐直接写 ``["to_q", "to_v"]``。
+    （diffusers ``Attention`` 模块）。目标名支持两种写法：
+
+    - 裸名 ``["to_q", "to_v"]``：子串匹配叶子名，自注意力 + 交叉注意力全挂；
+    - 带点模式 ``["attn2.to_q", "attn2.to_v"]``：完整模块名后缀匹配，
+      仅挂 cross-attention（挂点数减半）。
 
     Args:
         dit: 冻结的 TripoSG DiT。
         rank: LoRA 秩。
-        target_modules: 目标模块名列表（如 ["to_q", "to_v"]）。
+        target_modules: 目标模块名列表（裸名 ``["to_q", "to_v"]`` 或带点
+            后缀模式 ``["attn2.to_q", "attn2.to_v"]``）。
         alpha: LoRA 缩放系数，默认取 rank（scaling=1）。
 
     Returns:
@@ -217,7 +238,7 @@ def inject_lora(
         if not isinstance(module, nn.Linear):
             continue
         leaf = name.rsplit(".", 1)[-1] if "." in name else name
-        if not _match_target(leaf, target_modules):
+        if not _match_target(name, target_modules):
             continue
         # 找到父模块并原地替换属性
         parent = dit
@@ -246,13 +267,61 @@ def lora_state_dict(adapters: Dict[str, LoRALinear]) -> Dict[str, Tensor]:
 
 
 def load_lora_state_dict(adapters: Dict[str, LoRALinear], state: Dict[str, Tensor]) -> None:
-    """把 checkpoint 中的 LoRA 权重写回适配器。"""
+    """把 checkpoint 中的 LoRA 权重写回适配器。
+
+    双向校验：适配器缺键会 KeyError（原有行为）；权重里存在未被任何已挂载
+    适配器消费的键同样 KeyError（防止训练 84 挂点权重被推理 42 挂点加载时
+    attn1 增量被静默丢弃）。
+    """
     for name, adapter in adapters.items():
         key_a, key_b = f"{name}.lora_A", f"{name}.lora_B"
         if key_a not in state or key_b not in state:
             raise KeyError(f"checkpoint 缺少 LoRA 权重: {key_a} / {key_b}")
         adapter.lora_A.data.copy_(state[key_a].to(adapter.lora_A.device))
         adapter.lora_B.data.copy_(state[key_b].to(adapter.lora_B.device))
+
+    consumed = {
+        f"{name}.{suffix}" for name in adapters for suffix in ("lora_A", "lora_B")
+    }
+    unconsumed = [key for key in state if key not in consumed]
+    if unconsumed:
+        preview = ", ".join(unconsumed[:4])
+        raise KeyError(
+            f"LoRA 权重含 {len(unconsumed)} 个未被任何已挂载适配器消费的键"
+            f"（前几个: {preview} ...）。通常是挂点数少于训练侧（如 v4 的 42 挂点"
+            "加载旧 84 挂点权重），请核对 lora_target_modules 与训练配置一致"
+        )
+
+
+# 优化器默认 weight decay（历史硬编码值；lora_B 单独分组时 lora_A 沿用该值）
+DEFAULT_WEIGHT_DECAY = 0.01
+
+
+def build_lora_param_groups(
+    adapters: Dict[str, LoRALinear], lora_b_weight_decay: float = 0.0
+) -> Any:
+    """构造优化器参数（B 矩阵锚：lora_B 可单独施加 weight_decay）。
+
+    - ``lora_b_weight_decay <= 0.0``（配置缺省）：返回与历史行为一致的扁平
+      参数列表（逐适配器 A / B 交错排列，单一默认参数组），训练逐位不变；
+    - 否则返回两个参数组：lora_B 组施加 ``lora_b_weight_decay``（把 B 矩阵
+      锚向零，抑制 LoRA 增量幅度失控），lora_A 组保持 ``DEFAULT_WEIGHT_DECAY``。
+    """
+    if float(lora_b_weight_decay) <= 0.0:
+        return [
+            param
+            for adapter in adapters.values()
+            for param in (adapter.lora_A, adapter.lora_B)
+        ]
+    group_b = {
+        "params": [adapter.lora_B for adapter in adapters.values()],
+        "weight_decay": float(lora_b_weight_decay),
+    }
+    group_a = {
+        "params": [adapter.lora_A for adapter in adapters.values()],
+        "weight_decay": DEFAULT_WEIGHT_DECAY,
+    }
+    return [group_b, group_a]
 
 
 # ====================================================================== #
@@ -474,13 +543,38 @@ class LatentCacheDataset(Dataset):
             raise RuntimeError(f"latent 缓存为空: {cache_dir}")
         self._shard_cache: Dict[str, Dict[str, Any]] = {}
 
-        # 探测首个 shard 的 image_embeds 序列长度（缺失时用默认值造零嵌入）
-        first_shard = self._get_shard(self.index[0][0])
-        embeds = first_shard.get("image_embeds", None)
-        if embeds is not None:
-            self.cond_num_tokens = int(embeds.shape[1])
-            self.cond_dim = int(embeds.shape[2])
+        # 扫描全部 shard 的 image_embeds token 维（混装护栏）：不同口径
+        # （如 1370 与 257）混在同一缓存里会在 DataLoader collate 时
+        # 训练中途崩溃，这里初始化时全量扫描、发现不一致立即报错。
+        # shard 不大，逐个加载可接受；扫完释放进程缓存避免常驻内存
+        shard_names: List[str] = []
+        for shard_name, _ in self.index:
+            if shard_name not in shard_names:
+                shard_names.append(shard_name)
+        embed_shapes: Dict[Tuple[int, int], List[str]] = {}
+        for shard_name in shard_names:
+            embeds = self._get_shard(shard_name).get("image_embeds", None)
+            if embeds is None:
+                continue  # 无 image_embeds 的 shard 按零嵌入处理，不参与形状校验
+            embed_shapes.setdefault(
+                (int(embeds.shape[1]), int(embeds.shape[2])), []
+            ).append(shard_name)
+        self._shard_cache.clear()
+        if len(embed_shapes) > 1:
+            detail = "; ".join(
+                f"{tokens}x{dim} token: {names}"
+                for (tokens, dim), names in embed_shapes.items()
+            )
+            raise RuntimeError(
+                f"latent 缓存 {cache_dir} 的 image_embeds 形状混装：{detail}。"
+                "不同 token 口径（如 1370 / 257）禁止混入同一训练缓存，"
+                "请重建缓存（scripts/precompute_latents.py / precompute_objaverse_stream.py）"
+            )
+        if embed_shapes:
+            # 形状已验证全局一致，任取一组作为条件嵌入形状
+            (self.cond_num_tokens, self.cond_dim) = next(iter(embed_shapes))
         else:
+            # 整个缓存都没有 image_embeds：用默认值造零嵌入
             self.cond_num_tokens = DIT_COND_NUM_TOKENS
             self.cond_dim = DIT_COND_DIM
 
@@ -655,6 +749,64 @@ class LoRAEMA:
 # ====================================================================== #
 # 训练步：rectified flow
 # ====================================================================== #
+def parse_condition_dropout(train_cfg: Dict[str, Any]) -> float:
+    """读取 ``training.condition_dropout``（默认 0.0 = 不启用）并校验区间。
+
+    合法值必须在 [0, 1]；越界或 NaN 一律 ValueError（NaN 的比较恒为 False，
+    会被同一条件拦下），防止坏配置静默进入训练循环。
+    """
+    value = float(train_cfg.get("condition_dropout", 0.0))
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(
+            f"training.condition_dropout 必须在 [0, 1]，实际 {value}"
+        )
+    return value
+
+
+def parse_lora_b_weight_decay(train_cfg: Dict[str, Any]) -> float:
+    """读取 ``training.lora_b_weight_decay``（默认 0.0 = 关闭）并校验。
+
+    必须为非负有限值；负值 / NaN / inf 一律 ValueError，防止坏配置静默进入
+    优化器。0.0 = 与历史单一参数组行为逐位一致（由 build_lora_param_groups 保证）。
+    """
+    value = float(train_cfg.get("lora_b_weight_decay", 0.0))
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            f"training.lora_b_weight_decay 必须为非负有限值，实际 {value}"
+        )
+    return value
+
+
+def apply_condition_dropout(
+    cond: Optional[Tensor], p: float, generator: Optional[torch.Generator] = None
+) -> Optional[Tensor]:
+    """训练期 condition dropout：逐样本独立以概率 p 把整条 image_embeds 置零（纯函数）。
+
+    与官方 CFG 空分支一致——用 ``zeros_like`` 置零（保持 dtype / 形状），
+    让模型把「零嵌入 == 无条件」学进分布内；否则推理 CFG 的 uncond 分支
+    对 LoRA 属分布外，高 cfg_scale 外推会放大损坏。
+
+    Args:
+        cond: 图像条件嵌入 [B, S, D]；None 或 p <= 0 时原样返回（零开销路径）。
+        p: 逐样本置零概率（0~1）。
+        generator: 可选随机数生成器（测试可复现用）；None 用全局 RNG。
+            若非 None，其 device 必须与 ``cond.device`` 一致（torch.rand
+            要求生成器与目标设备匹配，否则抛 RuntimeError）。
+
+    Returns:
+        置零后的条件张量（不修改输入本身）；无需 dropout 时返回原对象。
+    """
+    if cond is None or p <= 0.0:
+        return cond
+    batch_size = cond.shape[0]
+    mask = torch.rand(batch_size, device=cond.device, generator=generator) < float(p)
+    if not mask.any():
+        return cond
+    # 掩码广播到 [B, 1, ..., 1]：被选中的样本整条置零，其余逐元素不变
+    shape = (batch_size,) + (1,) * (cond.dim() - 1)
+    return torch.where(mask.view(*shape), torch.zeros_like(cond), cond)
+
+
 def train_step(
     dit: nn.Module,
     latents: Tensor,
@@ -1083,7 +1235,7 @@ def run_evaluation(
     config: Dict[str, Any],
     device: torch.device,
     writer: Optional[Any],
-) -> None:
+) -> Optional[Dict[str, float]]:
     """定期评估：EMA 权重采样 latent -> 解码 mesh -> 渲染预览图 + 附加指标。
 
     渲染参数（image_size / num_views / camera_distance / elevation_range）全部
@@ -1095,6 +1247,11 @@ def run_evaluation(
       按 Critic 训练时的 rendering 配置单独构建（与 ``inference.py`` 对齐）。
 
     评估（含两个附加指标）失败只记警告，绝不中断训练。
+
+    Returns:
+        本轮 eval 均值分数字典（键 ``clip_score`` / ``critic_score``，仅在
+        对应指标有有效样本时存在）；评估未能进行（渲染器 / VAE 不可用）
+        时返回 None。供 best checkpoint 跟踪计算复合分。
     """
     output_dir = config.get("logging", {}).get("output_dir", "./outputs/diffusion_train")
     eval_dir = os.path.join(output_dir, "eval")
@@ -1208,13 +1365,16 @@ def run_evaluation(
                 writer.add_image("eval/samples", grid_np, iteration, dataformats="HWC")
 
         # ---- 附加指标汇总（无有效样本的指标不写日志）---- #
+        scores: Dict[str, float] = {}
         for key, values in (("clip_score", clip_scores), ("critic_score", critic_scores)):
             if not values:
                 continue
             mean_value = sum(values) / len(values)
+            scores[key] = mean_value
             LOGGER.info("[评估] %s %.4f（%d 个样本）", key, mean_value, len(values))
             if writer is not None:
                 writer.add_scalar(f"eval/{key}", mean_value, iteration)
+        return scores
     finally:
         LoRAEMA.restore(adapters, backup)
         dit.train()
@@ -1274,6 +1434,43 @@ def load_checkpoint(
     return start_iteration
 
 
+class BestCheckpointer:
+    """按生成质量跟踪 best checkpoint（复合分 = eval clip × critic）。
+
+    复合分取训练内 eval 的 ``clip_score`` 均值（CLIP 图文余弦相似度，
+    有界于 [-1, 1]）与 ``critic_score`` 均值（SemanticCritic plausibility，
+    有界于 [0, 1]）的**原始乘积**，不做归一化：两项指标本身有界且方向一致
+    （越大越好），乘积对二者均单调，任一指标退化都会拉低复合分；归一化
+    反而会引入对历史分数序列的依赖，不可复现。
+
+    仅当两项指标都有效时才参与 best 竞争；复合分严格变高才刷新。
+    """
+
+    def __init__(self) -> None:
+        self.best_composite: Optional[float] = None
+        self.best_iteration: Optional[int] = None
+
+    def offer(self, iteration: int, clip_score: float, critic_score: float) -> bool:
+        """提交一次 eval 分数；复合分严格更高时刷新 best 并返回 True。
+
+        复合分为 NaN / inf（任一指标非有限）时打 warning 并直接 return False，
+        不参与 best 竞争，防止脏分数污染 best 记录。
+        """
+        composite = float(clip_score) * float(critic_score)
+        if not math.isfinite(composite):
+            LOGGER.warning(
+                "[best] eval 分数含非有限值（clip=%s, critic=%s），跳过本轮 best 竞争",
+                clip_score,
+                critic_score,
+            )
+            return False
+        if self.best_composite is None or composite > self.best_composite:
+            self.best_composite = composite
+            self.best_iteration = int(iteration)
+            return True
+        return False
+
+
 # ====================================================================== #
 # 主流程
 # ====================================================================== #
@@ -1311,6 +1508,10 @@ def main() -> None:
     accumulation_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
     timestep_scale = float(train_cfg.get("timestep_scale", 1000.0))
     learning_rate = float(train_cfg.get("learning_rate", 1e-4))
+    # Condition dropout：训练期逐样本以概率 p 把 image_embeds 置零，让 CFG 的
+    # uncond 零嵌入分支留在分布内；0.0 = 不启用，训练行为与原来完全一致。
+    # 区间校验（含 NaN）在 parse_condition_dropout 内完成
+    condition_dropout = parse_condition_dropout(train_cfg)
 
     # 附加评估配置（旧配置缺失 evaluation 段时全部回落默认值；
     # num_val_samples 默认 0 = 不切验证集，训练行为与原来完全一致）
@@ -1321,6 +1522,10 @@ def main() -> None:
 
     device = torch.device(args.device)
     LOGGER.info("扩散 LoRA 微调启动：device=%s, bf16=%s", device, use_bf16)
+    LOGGER.info(
+        "condition_dropout=%s",
+        condition_dropout if condition_dropout > 0.0 else "0.0（未启用）",
+    )
 
     # ---- 模型 / 优化器 / 调度器 ----
     dit, adapters, vae = build_dit_with_lora(config, device)
@@ -1331,7 +1536,15 @@ def main() -> None:
     lora_params = [
         param for adapter in adapters.values() for param in (adapter.lora_A, adapter.lora_B)
     ]
-    optimizer = torch.optim.AdamW(lora_params, lr=learning_rate, weight_decay=0.01)
+    # B 矩阵锚：lora_B 单独一组施加 training.lora_b_weight_decay（缺省 0.0 时
+    # 退化为原有单一参数组，训练行为逐位不变）；梯度裁剪仍对全量 LoRA 参数
+    lora_b_weight_decay = parse_lora_b_weight_decay(train_cfg)
+    if lora_b_weight_decay > 0.0:
+        LOGGER.info("B 矩阵锚已启用：lora_B weight_decay=%.4g", lora_b_weight_decay)
+    param_groups = build_lora_param_groups(adapters, lora_b_weight_decay)
+    optimizer = torch.optim.AdamW(
+        param_groups, lr=learning_rate, weight_decay=DEFAULT_WEIGHT_DECAY
+    )
     # 调度器按实际优化器步数构建（每 accumulation_steps 个迭代才 step 一次），
     # 与训练循环中 scheduler.step() 的调用频率保持一致
     total_optim_steps = max(1, max_iterations // accumulation_steps)
@@ -1413,6 +1626,14 @@ def main() -> None:
 
     # ---- 训练循环（训练步内不做任何渲染 / VAE 调用）----
     optimizer.zero_grad(set_to_none=True)
+    # best checkpoint 跟踪（配方 4）：training.save_best_checkpoint 显式开启才生效，
+    # 旧配置缺省该字段时不产生任何新行为；复合分 = eval clip × critic
+    # （未归一化，见 BestCheckpointer）；断点续训时不恢复历史 best，
+    # 由续训后首轮达标 eval 重新竞争
+    save_best_checkpoint = bool(train_cfg.get("save_best_checkpoint", False))
+    best_checkpointer = BestCheckpointer()
+    if save_best_checkpoint:
+        LOGGER.info("best checkpoint 跟踪已启用：复合分 = eval clip × critic（未归一化）")
     loss_window: List[float] = []
     weight_window: List[float] = []
     grad_norm = 0.0
@@ -1424,6 +1645,10 @@ def main() -> None:
         cond = batch.get("image_embeds", None)
         if cond is not None:
             cond = cond.to(device, non_blocking=True)
+        # Condition dropout 仅训练分支生效（验证前向 compute_validation_loss
+        # 不经过此处）；p=0 时 if 门控短路，行为逐条不变
+        if cond is not None and condition_dropout > 0.0:
+            cond = apply_condition_dropout(cond, condition_dropout)
         # Learned Semantic Reward 训练加权：未配置 critic_weights_path 时恒为 None，行为不变
         sample_weights = None
         if dataset.critic_weights:
@@ -1489,12 +1714,55 @@ def main() -> None:
         if eval_interval > 0 and (iteration + 1) % eval_interval == 0:
             # 评估是观测手段而非训练关键路径：内部仅 try/finally，异常会
             # 逃逸出来直接中断训练，这里兜底捕获（不吞 KeyboardInterrupt）
+            eval_scores: Optional[Dict[str, float]] = None
             try:
-                run_evaluation(
+                eval_scores = run_evaluation(
                     iteration + 1, dit, adapters, ema, vae, dataset, config, device, writer
                 )
             except Exception as exc:
                 LOGGER.warning("[评估] 本轮评估整体失败，已跳过，训练继续：%s", exc)
+
+            # ---- 按生成质量留 best checkpoint（复合分 = clip × critic）----
+            if (
+                save_best_checkpoint
+                and eval_scores
+                and "clip_score" in eval_scores
+                and "critic_score" in eval_scores
+                and best_checkpointer.offer(
+                    iteration + 1, eval_scores["clip_score"], eval_scores["critic_score"]
+                )
+            ):
+                LOGGER.info(
+                    "BEST_UPDATE | iter %d | clip %.4f | critic %.4f | composite %.6f",
+                    iteration + 1,
+                    eval_scores["clip_score"],
+                    eval_scores["critic_score"],
+                    best_checkpointer.best_composite,
+                )
+                if writer is not None:
+                    writer.add_scalar(
+                        "eval/best_composite", best_checkpointer.best_composite, iteration + 1
+                    )
+                # 与 ckpt_final.pt 相同的 save_checkpoint 结构（含 lora / ema）；
+                # 先写 .tmp 再 os.replace 原子替换，避免写一半被打断留下
+                # 损坏的 ckpt_best.pt；保存失败降级为 warning 不中断训练
+                # （与 eval 兜底策略一致）
+                best_path = os.path.join(output_dir, "ckpt_best.pt")
+                best_tmp_path = best_path + ".tmp"
+                try:
+                    save_checkpoint(
+                        best_tmp_path, adapters, ema, optimizer, scheduler, iteration + 1, config
+                    )
+                    os.replace(best_tmp_path, best_path)
+                except Exception as exc:
+                    LOGGER.warning(
+                        "[best] ckpt_best.pt 保存失败，降级跳过（训练继续）：%s", exc
+                    )
+                    if os.path.isfile(best_tmp_path):
+                        try:
+                            os.remove(best_tmp_path)
+                        except OSError:
+                            pass
 
         # ---- 定期保存 ----
         if save_interval > 0 and (iteration + 1) % save_interval == 0:
@@ -1509,6 +1777,14 @@ def main() -> None:
             )
 
     # ---- 收尾：最终 checkpoint + 导出纯 LoRA 权重（便于推理侧加载）----
+    if save_best_checkpoint and best_checkpointer.best_composite is None:
+        # best 从未产出：说明整轮没有一次 eval 同时拿到有效 clip 与 critic 分数
+        LOGGER.warning(
+            "save_best_checkpoint=true 但整轮训练未产出 ckpt_best.pt："
+            "从未出现 clip_score 与 critic_score 同时有效的评估。请检查 "
+            "evaluation.clip_model_name / evaluation.critic_checkpoint 是否可用、"
+            "VAE 解码与渲染链路是否正常（eval 日志中的警告可定位缺失环节）"
+        )
     final_path = os.path.join(output_dir, "ckpt_final.pt")
     save_checkpoint(final_path, adapters, ema, optimizer, scheduler, max_iterations, config)
     torch.save(
