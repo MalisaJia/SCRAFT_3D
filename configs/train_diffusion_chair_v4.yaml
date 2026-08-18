@@ -4,7 +4,7 @@
 # 背景：v3 满火力（rank16 / 84 挂点 / lr1e-4 / 3000 步）"方向对、幅度失控"，
 # 推理端打 1 折才恢复完整椅子。v4 四条修复全部落在训练侧：
 #   1. 仅挂 cross-attention（attn2，挂点 84 -> 42）
-#   2. 降容降火：rank 4、lr 3e-5、800 步、condition_dropout 0.1
+#   2. 降容降火：rank 4、lr 3e-5、400 步、condition_dropout 0.1
 #   3. B 矩阵锚：lora_B 单独参数组 weight_decay 1e-2
 #   4. 按生成质量留 ckpt_best.pt（复合分 = eval clip × critic，见 BestCheckpointer）
 # 注意：禁止 --resume 指向 v1~v3 checkpoint（挂点结构 84 vs 42、参数组拆分
@@ -30,16 +30,21 @@ training:
   # 降火：lr 1e-4 -> 3e-5
   learning_rate: 3.0e-5
   lr_scheduler: "cosine"
-  # 总步数只有 800，warmup 相应缩短（原 500 会吞掉大半训练预算）
+  # 总步数只有 400，warmup 相应缩短（原 500 会吞掉大半训练预算）
   warmup_steps: 100
-  # 降火：3000 -> 800
-  max_iterations: 800
+  # 降火 + 甜区收紧：3000 -> 800 -> 400（800 步跑下来 clip/critic 均无增益，
+  # 甜区在前段，后半程纯属过拟合风险）
+  max_iterations: 400
   gradient_accumulation_steps: 2
   use_bf16: true
   gradient_checkpointing: true
   ema_decay: 0.9999
   # RectifiedFlowScheduler 约定：t ∈ [0,1] 缩放至 [0, 1000] 后送入 DiT
   timestep_scale: 1000.0
+  # 训练内 eval 采样步数：与推理侧（diffusion_inference.yaml 的 num_steps=50）
+  # 对齐；旧的 25 步自研 Euler 采样器积分方向与官方相反，产出全是黑底碎屑，
+  # 使 BestCheckpointer 的 clip × critic 复合分全程无区分度（~0.12 噪声）
+  eval_num_steps: 50
   # Learned Semantic Reward 训练加权保留（v3 同款）：指向 critic_weights.json
   # （{uid: weight}，均值已归一到 1.0），按 uid 逐样本加权扩散 MSE 损失。
   # 指向 257 口径椅子缓存内已复制就位的那份（v3 训练即用它）
@@ -65,10 +70,10 @@ data:
 # Logging
 logging:
   log_interval: 50
-  # 800 步总预算：400 步留一个中途 ckpt，收尾照常产 ckpt_final.pt；
+  # 400 步总预算：收尾与定期保存重合（ckpt_0000400.pt + ckpt_final.pt）；
   # best 刷新由训练内 eval 驱动（ckpt_best.pt，不受本间隔控制）
   save_interval: 400
-  # 配方 4：800 步内每 100 步做一次生成评估（共 8 次），best 竞争粒度适中
+  # 配方 4：400 步内每 100 步做一次生成评估（共 4 次），best 竞争粒度适中
   eval_interval: 100
   # TODO(server): 如需独立输出目录，由服务器侧负责人调整
   output_dir: "./outputs/diffusion_train_chair_v4"
@@ -84,7 +89,7 @@ rendering:
 # Evaluation
 # 附加评估指标，全部可选：任一依赖不可用时静默跳过，不影响训练主流程
 evaluation:
-  # held-out 验证 MSE 间隔：与 eval_interval 对齐（800 步共 8 次）
+  # held-out 验证 MSE 间隔：与 eval_interval 对齐（400 步共 4 次）
   interval: 100
   num_val_samples: 16
   val_batch_size: 4

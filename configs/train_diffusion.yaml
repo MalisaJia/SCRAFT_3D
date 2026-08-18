@@ -24,6 +24,12 @@ training:
   ema_decay: 0.9999
   # RectifiedFlowScheduler 约定：t ∈ [0,1] 缩放至 [0, 1000] 后送入 DiT
   timestep_scale: 1000.0
+  # 训练内 eval（run_evaluation）的采样步数。与推理侧对齐：
+  # configs/diffusion_inference.yaml 的 model.diffusion.num_steps = 50，
+  # TripoSGPipeline 默认 num_inference_steps 也是 50。采样调度、积分方向与 CFG
+  # 实现均复刻官方 RectifiedFlowScheduler（见 sample_latent_flow），
+  # 保证训练内 eval 的 mesh 质量与推理侧同质，clip × critic 复合分才有区分度
+  eval_num_steps: 50
   # Learned Semantic Reward 训练加权：指向 scripts/score_latents_critic.py 产出的
   # critic_weights.json（{uid: weight}，均值已归一到 1.0）；按 uid 逐样本加权
   # 扩散 MSE 损失，缺失 uid 按 1.0。null = 不启用，训练行为与原来完全一致

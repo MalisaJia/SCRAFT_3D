@@ -7,7 +7,11 @@ b) 参数组拆分：lora_B 带独立 weight_decay、lora_A 保持默认；缺�
 c) BestCheckpointer 在模拟分数序列下的刷新逻辑（含 NaN 防护）；
 d) load_lora_state_dict 未消费键校验；
 e) LatentCacheDataset 混装缓存护栏；
-f) lora_b_weight_decay 配置校验。
+f) lora_b_weight_decay 配置校验；
+g) eval 采样器（推理同款 rectified-flow）：eval_num_steps 校验、sigma 网格、
+   积分方向、CFG 组合方式与噪声可复现性。
+h) 训练目标速度场符号（v1.5 修正）：``v = x₀ - ε`` 与基座
+   ``RectifiedFlowScheduler.step`` 的积分恒等式自洽，且 train_step 实际用的就是该符号。
 
 运行：python tests/test_v4_recipes.py
 """
@@ -34,14 +38,23 @@ import torch.nn as nn
 
 from train_diffusion import (  # noqa: E402
     DEFAULT_WEIGHT_DECAY,
+    EVAL_FLOW_SHIFT,
+    EVAL_GUIDANCE_SCALE,
+    EVAL_NUM_STEPS,
     BestCheckpointer,
     LatentCacheDataset,
+    _EVAL_MODEL_CACHE,
     _match_target,
     build_lora_param_groups,
+    flow_match_sigmas,
     inject_lora,
     load_lora_state_dict,
     lora_state_dict,
+    parse_eval_num_steps,
     parse_lora_b_weight_decay,
+    resolve_flow_shift,
+    sample_latent_flow,
+    train_step,
 )
 
 RESULTS = []
@@ -266,6 +279,204 @@ def test_lora_b_decay_validation() -> None:
             check(f"非法值 {bad} 被 ValueError 拦截", True)
 
 
+# ------------------------------------------------------------------ #
+# mock DiT：速度场可解析，用于验证采样循环的积分方向与 CFG 组合
+# ------------------------------------------------------------------ #
+class MockFlowDiT(nn.Module):
+    """速度场 = 每样本条件嵌入绝对值均值（无条件行 -> 0），并记录调用轨迹。
+
+    这样 ``sample_latent_flow`` 的输出可闭式推导：单分支时
+    ``x_T + sum(sigma_i - sigma_{i+1}) * v = x_T + (sigmas[0] - sigmas[-1]) * v``。
+    """
+
+    def __init__(self, channels: int = 64):
+        super().__init__()
+        self.channels = channels
+        self.batch_sizes = []
+        self.timesteps = []
+        # 需要至少一个参数，便于外部按常规模型对待
+        self.dummy = nn.Parameter(torch.zeros(1))
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states=None, return_dict=True):
+        self.batch_sizes.append(int(hidden_states.shape[0]))
+        self.timesteps.append(float(timestep.reshape(-1)[0].item()))
+        if encoder_hidden_states is None:
+            scale = torch.zeros(hidden_states.shape[0], device=hidden_states.device)
+        else:
+            scale = encoder_hidden_states.abs().flatten(1).mean(dim=1)
+        velocity = torch.ones_like(hidden_states) * scale.view(-1, 1, 1)
+        return (velocity,) if not return_dict else velocity
+
+
+def test_eval_sampler() -> None:
+    print("[g] eval 采样器（推理同款 rectified-flow）")
+    device = torch.device("cpu")
+
+    # --- eval_num_steps 配置校验：缺省 = 推理侧 50 ---
+    check("eval_num_steps 缺省 50（与推理一致）",
+          parse_eval_num_steps({}) == EVAL_NUM_STEPS == 50)
+    check("eval_num_steps 显式值生效", parse_eval_num_steps({"eval_num_steps": 30}) == 30)
+    for bad in (0, -5):
+        try:
+            parse_eval_num_steps({"eval_num_steps": bad})
+            check(f"非法 eval_num_steps {bad} 被 ValueError 拦截", False)
+        except ValueError:
+            check(f"非法 eval_num_steps {bad} 被 ValueError 拦截", True)
+
+    # --- sigma 网格：官方 set_timesteps 的形状与端点 ---
+    sigmas = flow_match_sigmas(50, EVAL_FLOW_SHIFT)
+    check("sigmas 长度 = N + 1", tuple(sigmas.shape) == (51,))
+    check("首个 sigma = 1（纯噪声）", abs(float(sigmas[0]) - 1.0) < 1e-6)
+    check("末个 sigma = 0（干净 latent）", abs(float(sigmas[-1])) < 1e-12)
+    check("sigma 严格单调递减", bool((sigmas[1:] < sigmas[:-1]).all()))
+    check("shift=1 时步长均匀 = 1/N",
+          bool(torch.allclose(sigmas[:-1] - sigmas[1:], torch.full((50,), 0.02), atol=1e-6)))
+    # shift != 1 的 warp：sigma' = shift*s / (1 + (shift-1)*s)，端点不变
+    warped = flow_match_sigmas(4, 3.0)
+    expected = torch.tensor([1.0, 3 * 0.75 / (1 + 2 * 0.75), 3 * 0.5 / (1 + 2 * 0.5),
+                             3 * 0.25 / (1 + 2 * 0.25), 0.0])
+    check("shift=3 的 sigma warp 与官方公式一致",
+          bool(torch.allclose(warped, expected, atol=1e-6)))
+    try:
+        flow_match_sigmas(0)
+        check("num_steps=0 被 ValueError 拦截", False)
+    except ValueError:
+        check("num_steps=0 被 ValueError 拦截", True)
+
+    # --- 积分方向：官方 x <- x + (sigma - sigma_next) * v（旧实现为 -） ---
+    latent_shape = (8, 64)
+    cond = torch.ones(1, 4, 8)  # abs().mean() = 1 -> 速度场 = 全 1
+    dit = MockFlowDiT()
+    gen = torch.Generator(device="cpu").manual_seed(0)
+    x_init = torch.randn((1, *latent_shape), generator=gen, dtype=torch.float32).squeeze(0)
+    out = sample_latent_flow(
+        dit, latent_shape, device, num_steps=10,
+        cond=cond, guidance_scale=1.0,  # 关掉 CFG，单分支验证方向
+        generator=torch.Generator(device="cpu").manual_seed(0),
+    )
+    check("输出形状 = latent_shape（已去 batch 维）", tuple(out.shape) == latent_shape)
+    check("单分支积分 = x_T + (sigma_0 - sigma_N) * v（方向与官方一致）",
+          bool(torch.allclose(out, x_init + 1.0, atol=1e-4)))
+    check("guidance_scale<=1 时不做双分支前向", set(dit.batch_sizes) == {1})
+    check("共走满 10 步", len(dit.batch_sizes) == 10)
+    check("首步时间步 = sigma_0 × timestep_scale = 1000",
+          abs(dit.timesteps[0] - 1000.0) < 1e-3)
+    check("末步时间步 = sigma_{N-1} × 1000 = 100", abs(dit.timesteps[-1] - 100.0) < 1e-3)
+
+    # --- CFG：batch=2 单次前向，v = v_uncond + gs * (v_cond - v_uncond) ---
+    dit_cfg = MockFlowDiT()
+    out_cfg = sample_latent_flow(
+        dit_cfg, latent_shape, device, num_steps=10,
+        cond=cond, guidance_scale=EVAL_GUIDANCE_SCALE,
+        generator=torch.Generator(device="cpu").manual_seed(0),
+    )
+    check("CFG 走 batch=2 单次前向（不是两次独立前向）",
+          set(dit_cfg.batch_sizes) == {2} and len(dit_cfg.batch_sizes) == 10)
+    # uncond 行为零嵌入 -> v_uncond = 0；v = gs * v_cond = 7
+    check("CFG 组合 = uncond + 7.0 × (cond - uncond)",
+          bool(torch.allclose(out_cfg, x_init + EVAL_GUIDANCE_SCALE, atol=1e-3)))
+    check("cfg 强度 7.0 与推理侧一致", EVAL_GUIDANCE_SCALE == 7.0)
+
+    # --- 条件全零（无 image_embeds 回退）：退化单分支，不付双倍开销 ---
+    dit_zero = MockFlowDiT()
+    sample_latent_flow(
+        dit_zero, latent_shape, device, num_steps=3,
+        cond=torch.zeros(1, 4, 8), guidance_scale=EVAL_GUIDANCE_SCALE,
+        generator=torch.Generator(device="cpu").manual_seed(0),
+    )
+    check("零条件退化为单分支采样", set(dit_zero.batch_sizes) == {1})
+
+    # --- 无梯度 + 固定噪声可复现（best checkpoint 竞争需要可比分数）---
+    check("采样结果不带梯度（@torch.no_grad）", not out.requires_grad)
+    repeat = sample_latent_flow(
+        MockFlowDiT(), latent_shape, device, num_steps=10,
+        cond=cond, guidance_scale=1.0,
+        generator=torch.Generator(device="cpu").manual_seed(0),
+    )
+    check("同种子 generator 采样逐位可复现", torch.equal(out, repeat))
+
+    # --- shift 解析：优先读权重目录的 scheduler_config.json ---
+    import json as _json
+
+    cached = _EVAL_MODEL_CACHE.pop("flow_shift", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            sched_dir = os.path.join(tmp_dir, "scheduler")
+            os.makedirs(sched_dir)
+            with open(os.path.join(sched_dir, "scheduler_config.json"), "w", encoding="utf-8") as h:
+                _json.dump({"_class_name": "RectifiedFlowScheduler", "shift": 2.5}, h)
+            shift = resolve_flow_shift({"model": {"diffusion": {"weights_path": tmp_dir}}})
+            check("shift 取自权重目录 scheduler_config.json", abs(shift - 2.5) < 1e-9)
+        _EVAL_MODEL_CACHE.pop("flow_shift", None)
+        fallback = resolve_flow_shift({"model": {"diffusion": {"weights_path": ""}}})
+        check("权重目录缺失时回落默认 shift", abs(fallback - EVAL_FLOW_SHIFT) < 1e-9)
+    finally:
+        _EVAL_MODEL_CACHE.pop("flow_shift", None)
+        if cached is not None:
+            _EVAL_MODEL_CACHE["flow_shift"] = cached
+
+
+# ------------------------------------------------------------------ #
+# 训练目标速度场符号（v1.5）
+# ------------------------------------------------------------------ #
+class MockConstDiT(nn.Module):
+    """速度场恒为全 1（与输入无关）。
+
+    这样 ``train_step`` 的损失可闭式推导为 ``mean((1 - velocity_target)^2)``，
+    从而能从损失数值反解出它内部用的是哪个符号（不依赖读源码）。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(1))
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states=None, return_dict=True):
+        velocity = torch.ones_like(hidden_states)
+        return (velocity,) if not return_dict else velocity
+
+
+def test_velocity_target_sign() -> None:
+    print("[h] 训练目标速度场符号（v = x₀ - ε）")
+    torch.manual_seed(0)
+    latents = torch.randn(2, 8, 64)
+
+    # --- 1) 与基座 RectifiedFlowScheduler.step 的积分恒等式自洽 ---
+    # 官方 step：x_next = x + (sigma - sigma_next) * v。把前向插值
+    # x_sigma = (1 - sigma) * x₀ + sigma * ε 代入两端，v 必须 = x₀ - ε 才能精确成立。
+    noise = torch.randn_like(latents)
+    sigma, sigma_next = 0.8, 0.3
+    x_sigma = (1.0 - sigma) * latents + sigma * noise
+    x_sigma_next = (1.0 - sigma_next) * latents + sigma_next * noise
+    v_new = latents - noise  # v1.5 约定
+    v_old = noise - latents  # v1.0~v1.4 约定（反号）
+    check(
+        "v = x₀ - ε 精确满足官方 step 的积分恒等式",
+        bool(torch.allclose(x_sigma + (sigma - sigma_next) * v_new, x_sigma_next, atol=1e-5)),
+    )
+    check(
+        "v = ε - x₀（旧约定）不满足该恒等式",
+        not bool(torch.allclose(x_sigma + (sigma - sigma_next) * v_old, x_sigma_next, atol=1e-3)),
+    )
+
+    # --- 2) train_step 实际使用的符号：用常量速度场从损失反解 ---
+    dit = MockConstDiT()
+    seed = 20260819
+    torch.manual_seed(seed)
+    loss = float(train_step(dit, latents, use_bf16=False).item())
+    # 复现 train_step 内部的 RNG 消耗顺序（randn_like -> rand）以重建目标
+    torch.manual_seed(seed)
+    rep_noise = torch.randn_like(latents)
+    _ = torch.rand(latents.shape[0])
+    ones = torch.ones_like(latents)
+    loss_new = float(((ones - (latents - rep_noise)) ** 2).mean().item())
+    loss_old = float(((ones - (rep_noise - latents)) ** 2).mean().item())
+    check("train_step 的 velocity_target = latents - noise", abs(loss - loss_new) < 1e-5)
+    check(
+        "train_step 的 velocity_target ≠ noise - latents（旧反号约定）",
+        abs(loss - loss_old) > 1e-3,
+    )
+
+
 def main() -> None:
     torch.manual_seed(0)
     test_target_matching()
@@ -274,6 +485,8 @@ def main() -> None:
     test_unconsumed_keys()
     test_mixed_cache_guard()
     test_lora_b_decay_validation()
+    test_eval_sampler()
+    test_velocity_target_sign()
 
     passed = sum(1 for _, ok in RESULTS if ok)
     total = len(RESULTS)

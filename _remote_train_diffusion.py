@@ -6,17 +6,20 @@ Usage:
 单网络扩散训练管线（与 GAN 的 ``train.py`` 完全独立，不共享任何训练状态）：
 1. 加载冻结的 TripoSG DiT（``TripoSGDiTModel``，diffusers 目录布局权重），
    对注意力 ``to_q`` / ``to_v`` 投影注入 LoRA 适配器（仅训练 LoRA 参数）
-2. Rectified flow 目标：``x_t = (1-t)*x_0 + t*noise``，预测速度 ``v = noise - x_0``，
+2. Rectified flow 目标：``x_t = (1-t)*x_0 + t*noise``，预测速度 ``v = x_0 - noise``
+   （方向与基座 ``RectifiedFlowScheduler.step`` 一致，见 ``train_step`` 的推导），
    MSE 损失；时间步按真实调度器约定缩放至 [0, 1000]（``training.timestep_scale``）
 3. 数据来自 ``scripts/precompute_latents.py`` 预计算的 VAE latent shard
    （latent 形状 [2048, 64]），训练循环内不做任何渲染 / VAE 编解码
    （纯张量运算，速度最大化）；shard 中若含 DINOv2 ``image_embeds`` 则作为
    cross-attention 条件，缺失时按无条件（零嵌入，与官方 CFG 空分支一致）训练
 4. 训练特性：bf16 autocast、梯度检查点、LoRA 权重 EMA、cosine LR + warmup
-5. 定期评估：用 EMA 权重 Euler 采样 latent -> VAE 解码 SDF ->
-   ``triposg.inference_utils.hierarchical_extract_geometry`` 八叉树提取
-   -> ``MultiViewRenderer`` 渲染预览图（渲染参数取自配置 ``rendering`` 段；
-   评估失败不影响训练），并在依赖可用时附加 CLIP Score / Critic Score
+5. 定期评估：用 EMA 权重按**推理侧同款** rectified-flow 调度采样 latent
+   （``training.eval_num_steps`` 步，默认 50，与 ``TripoSGPipeline`` 一致）
+   -> VAE 解码 SDF -> ``triposg.inference_utils.hierarchical_extract_geometry``
+   八叉树提取 -> ``MultiViewRenderer`` 渲染预览图（渲染参数取自配置
+   ``rendering`` 段；评估失败不影响训练），并在依赖可用时附加
+   CLIP Score / Critic Score
 6. 可选 held-out 验证：从 latent 缓存尾部切出 ``evaluation.num_val_samples``
    个样本（永不参与训练），每 ``evaluation.interval`` 步计算一次无梯度 MSE
 7. 日志：TensorBoard（loss / LR / grad_norm / 评估渲染图 / ``eval/*`` 指标）
@@ -62,8 +65,15 @@ LOGGER = logging.getLogger("diffusion_train")
 # 梯度裁剪阈值（LoRA 微调通常较稳定，1.0 足以防御偶发尖峰）
 GRAD_CLIP = 1.0
 
-# 评估时 Euler 采样的步数（预览用途，不必追求高质量）
-EVAL_NUM_STEPS = 25
+# 评估采样默认步数（``training.eval_num_steps`` 缺省值）。与推理侧对齐：
+# configs/diffusion_inference.yaml 的 model.diffusion.num_steps = 50，
+# TripoSGPipeline 默认 num_inference_steps 同样是 50
+EVAL_NUM_STEPS = 50
+
+# 评估采样 sigma schedule 的默认 shift（官方 scheduler_config.json:
+# {"_class_name": "RectifiedFlowScheduler", "shift": 1, "use_dynamic_shifting": false}）。
+# 权重目录内有 scheduler 配置时以该文件为准（见 resolve_flow_shift）
+EVAL_FLOW_SHIFT = 1.0
 
 # 评估时 VAE 解码 SDF 的八叉树深度（res = 2^depth；8 -> 256，与正式推理
 # configs/diffusion_inference.yaml 的 octree_resolution=256 对齐）
@@ -88,6 +98,11 @@ EVAL_NUM_SAMPLES = 4
 # 验证损失的固定噪声种子：每次验证复用同一批噪声 / 时间步，使不同步数之间的
 # 验证 MSE 可直接比较（否则 rectified flow 的随机 t 会带来很大方差）
 VAL_NOISE_SEED = 1234
+
+# 评估采样的固定初始噪声种子：各次评估复用同一批初始噪声，clip / critic 分数
+# 的变化只来自权重更新，best checkpoint 竞争才有区分度（顺带让评估不再消耗
+# 全局 RNG，训练数据流不受评估影响）
+EVAL_NOISE_SEED = 5678
 
 # 评估用 CLIP / Critic 的进程内缓存（键 -> 模型或 None）。这两个模型只在评估时
 # 用到，但重复加载很慢，因此加载一次后常驻；加载失败也记入缓存，避免每轮重试
@@ -820,7 +835,17 @@ def train_step(
     Rectified flow 约定（t ∈ [0, 1]，与 ``RectifiedFlowScheduler`` 一致）::
 
         x_t     = (1 - t) * x_0 + t * noise
-        目标速度 v = noise - x_0   （即 dx_t / dt）
+        目标速度 v = x_0 - noise
+
+    速度方向由基座 ``RectifiedFlowScheduler.step`` 反推（sigma 即此处的 t）::
+
+        官方积分：  x_next = x + (sigma - sigma_next) * v
+        插值代入：  x_next - x = (sigma - sigma_next) * (x_0 - noise)
+        =>          v = x_0 - noise
+
+    注意这是 ``-dx_t/dt``：基座沿 sigma **递减**方向参数化速度场，与朴素的
+    ``dx_t/dt = noise - x_0`` 恰好反号。训练目标必须跟基座对齐，否则 LoRA 学到的
+    是反向速度场，采样时无论积分方向如何都无法与预训练权重叠加。
 
     Args:
         dit: 含 LoRA 的 DiT。
@@ -842,7 +867,11 @@ def train_step(
     t_expand = t.view(batch_size, *([1] * (latents.dim() - 1)))
 
     x_t = (1.0 - t_expand) * latents + t_expand * noise
-    velocity_target = noise - latents
+    # BREAKING CHANGE (v1.5): 速度场符号修正
+    # v1.0~v1.4 使用 velocity_target = noise - latents（与基座约定反号）
+    # v1.5 起修正为 velocity_target = latents - noise（与 RectifiedFlowScheduler.step 一致）
+    # 后果：v1.0~v1.4 训练的所有 LoRA 权重语义失效，不可直接加载使用
+    velocity_target = latents - noise  # rectified flow convention: v = x₀ - ε (matches RectifiedFlowScheduler.step)
 
     # 梯度检查点要求至少一个输入张量带梯度，x_t 作为锚点
     x_t = x_t.detach().requires_grad_(torch.is_grad_enabled())
@@ -919,7 +948,8 @@ def compute_validation_loss(
             )
             t_expand = t.view(latents.shape[0], *([1] * (latents.dim() - 1)))
             x_t = (1.0 - t_expand) * latents + t_expand * noise
-            velocity_target = noise - latents
+            # 符号与 train_step 一致（v1.5 修正，见那里的 BREAKING CHANGE 注释）
+            velocity_target = latents - noise  # rectified flow convention: v = x₀ - ε
 
             ctx = (
                 torch.cuda.amp.autocast(dtype=torch.bfloat16)
@@ -944,10 +974,96 @@ def compute_validation_loss(
 
 
 # ====================================================================== #
-# 评估：Euler 采样 -> VAE 解码 -> mesh -> 多视角渲染
+# 评估：推理同款 rectified-flow 采样 -> VAE 解码 -> mesh -> 多视角渲染
 # ====================================================================== #
+def parse_eval_num_steps(train_cfg: Dict[str, Any]) -> int:
+    """读取 ``training.eval_num_steps``（默认 50，与推理侧一致）并校验。
+
+    必须为正整数；<= 0 / 非数字一律报错，防止坏配置静默把评估采样退化成
+    零步（那会直接拿纯噪声去解码，分数彻底失去意义）。
+    """
+    value = int(train_cfg.get("eval_num_steps", EVAL_NUM_STEPS))
+    if value < 1:
+        raise ValueError(f"training.eval_num_steps 必须为正整数，实际 {value}")
+    return value
+
+
+def resolve_flow_shift(config: Dict[str, Any]) -> float:
+    """解析采样 sigma schedule 的 shift（进程内缓存）。
+
+    优先读 ``model.diffusion.weights_path`` 下的 ``scheduler/scheduler_config.json``
+    —— 推理侧 ``TripoSGPipeline.from_pretrained`` 用的就是这份配置，读同一份
+    文件才能保证训练内 eval 与推理走完全相同的时间网格；文件缺失 / 读失败
+    时回落 ``EVAL_FLOW_SHIFT``（官方权重快照里的值）。
+
+    本项目 latent token 数固定（[2048, 64]），不需要 ``use_dynamic_shifting``
+    的分辨率自适应时间偏移；配置里意外开了只告警，仍按静态 shift 采样。
+    """
+    if "flow_shift" in _EVAL_MODEL_CACHE:
+        return _EVAL_MODEL_CACHE["flow_shift"]
+
+    shift = EVAL_FLOW_SHIFT
+    diffusion_cfg = dict((config.get("model", {}) or {}).get("diffusion", {}) or {})
+    weights_dir = _resolve_weights_dir(str(diffusion_cfg.get("weights_path", "") or ""))
+    sched_path = None if weights_dir is None else weights_dir / "scheduler" / "scheduler_config.json"
+    if sched_path is not None and sched_path.is_file():
+        try:
+            with open(sched_path, "r", encoding="utf-8") as handle:
+                sched_cfg = json.load(handle) or {}
+            shift = float(sched_cfg.get("shift", shift))
+            if bool(sched_cfg.get("use_dynamic_shifting", False)):
+                LOGGER.warning(
+                    "[评估] %s 开启了 use_dynamic_shifting，latent token 数固定的形状"
+                    "扩散无需该机制，仍按静态 shift=%.3f 采样",
+                    sched_path,
+                    shift,
+                )
+            else:
+                LOGGER.info("[评估] 采样 sigma schedule shift=%.3f（取自 %s）", shift, sched_path)
+        except Exception as exc:  # 评估不能因一份 JSON 拖垮训练
+            LOGGER.warning(
+                "[评估] 读取 %s 失败（%s），sigma schedule 回落 shift=%.3f",
+                sched_path,
+                exc,
+                EVAL_FLOW_SHIFT,
+            )
+            shift = EVAL_FLOW_SHIFT
+    _EVAL_MODEL_CACHE["flow_shift"] = shift
+    return shift
+
+
+def flow_match_sigmas(num_steps: int, shift: float = EVAL_FLOW_SHIFT) -> Tensor:
+    """复刻 TripoSG ``RectifiedFlowScheduler.set_timesteps`` 的 sigma 序列。
+
+    官方实现（``triposg/schedulers/scheduling_rectified_flow.py``）::
+
+        sigmas = [(1 - i / N) for i in range(N)]          # 线性 sigma 网格
+        sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+        sigmas = cat([sigmas, 0])                        # 末步落到干净 latent
+        timesteps = sigmas * num_train_timesteps         # 送入 DiT 的时间步
+
+    ``num_train_timesteps`` 在 sigma 上约掉，只影响时间步缩放（本仓库由
+    ``training.timestep_scale`` 控制，默认 1000，与官方一致），因此这里只返回
+    sigma 序列。不直接实例化 ``TripoSGPipeline``：那会重新加载整套
+    VAE + DiT + DINOv2（双份显存），而训练进程里这些权重已经在位。
+
+    Args:
+        num_steps: 采样步数 N（>= 1）。
+        shift: sigma 偏移（1.0 = 不偏移，即官方权重快照的配置）。
+
+    Returns:
+        [N + 1] 的 fp32 张量；``sigmas[0] == 1``（纯噪声），``sigmas[-1] == 0``。
+    """
+    if num_steps < 1:
+        raise ValueError(f"num_steps 必须 >= 1，实际 {num_steps}")
+    grid = 1.0 - torch.arange(num_steps, dtype=torch.float32) / float(num_steps)
+    shift = float(shift)
+    sigmas = shift * grid / (1.0 + (shift - 1.0) * grid)
+    return torch.cat([sigmas, torch.zeros(1, dtype=torch.float32)])
+
+
 @torch.no_grad()
-def sample_latent_euler(
+def sample_latent_flow(
     dit: nn.Module,
     latent_shape: Tuple[int, ...],
     device: torch.device,
@@ -955,34 +1071,79 @@ def sample_latent_euler(
     timestep_scale: float = 1000.0,
     cond: Optional[Tensor] = None,
     guidance_scale: float = EVAL_GUIDANCE_SCALE,
+    shift: float = EVAL_FLOW_SHIFT,
+    use_bf16: bool = False,
+    generator: Optional[torch.Generator] = None,
 ) -> Tensor:
-    """用训练好的速度场从纯噪声做 Euler 反向积分，得到采样 latent。
+    """从纯噪声采样一个干净 latent，采样循环与 ``TripoSGPipeline.__call__`` 逐步对齐。
 
-    积分方向 t: 1 -> 0（x_1 = noise，x_0 = 数据），步长 dt = -1/num_steps。
+    与官方推理完全一致的三个关键点（旧自研 25 步手写 Euler 采样器在前两项上
+    与官方不一致，产出全是黑底碎屑）：
 
-    ``guidance_scale > 1.0`` 且 ``cond`` 非 None 时启用 classifier-free
-    guidance（与 TripoSG 官方推理一致）：每步用零嵌入算无条件速度
-    ``v_uncond``，用真实条件算 ``v_cond``，组合为
-    ``v = v_uncond + guidance_scale * (v_cond - v_uncond)``。
-    ``guidance_scale <= 1.0`` 或无条件（含全零条件回退）时退化为单分支采样，
-    避免双倍前向开销。
-    注意：CFG 只是评估/推理期采样技巧，不影响训练目标。
+    1. **积分方向**：官方 ``RectifiedFlowScheduler.step`` 为
+       ``x <- x + (sigma - sigma_next) * v``（源码注释明确写着
+       "Here different directions are used for the flow matching"），
+       即预训练 DiT 的速度场方向为 ``x_0 - noise``；旧采样器按
+       ``x <- x - dt * v`` 积分，方向正好相反。
+    2. **sigma 网格**：走 ``flow_match_sigmas``（含权重目录的 shift，末步精确
+       落到 sigma=0），而不是写死的均匀 ``dt = 1/N``。
+    3. **CFG**：与 pipeline 一样把 latent 拼成 batch=2 的单次前向
+       （``[negative, cond]`` 顺序，uncond 分支为 ``zeros_like(cond)``），
+       再组合 ``v = v_uncond + guidance_scale * (v_cond - v_uncond)``。
+
+    Args:
+        dit: 带 LoRA 的 DiT（调用方负责已切 eval / 已应用 EMA 权重）。
+        latent_shape: 单个 latent 的形状（如 ``(2048, 64)``）。
+        device: 采样设备。
+        num_steps: 采样步数（``training.eval_num_steps``，默认 50）。
+        timestep_scale: 时间步缩放（sigma -> DiT timestep，与训练一致）。
+        cond: DINOv2 图像条件 [1, S, 1024]；eval 不做 condition dropout，
+            直接用真实条件。
+        guidance_scale: CFG 强度（默认 7.0，与推理一致）；<= 1.0 或条件全零时
+            退化为单分支采样，不付双倍前向开销。
+        shift: sigma schedule 偏移（由 ``resolve_flow_shift`` 从权重目录解析）。
+        use_bf16: 是否开 bf16 autocast（与 ``training.use_bf16`` 一致；推理侧
+            pipeline 整体跑 bf16，开启后精度口径更接近）。latent 本体与积分
+            累加全程 fp32，与官方 scheduler 的 ``sample.to(torch.float32)`` 一致。
+        generator: 可选初始噪声生成器（其 device 需与 ``device`` 一致）。
+
+    Returns:
+        采样得到的干净 latent，形状 ``latent_shape``（已去掉 batch 维）。
     """
-    x = torch.randn((1, *latent_shape), device=device)
-    dt = 1.0 / float(num_steps)
+    sigmas = flow_match_sigmas(num_steps, shift).to(device)
+    x = torch.randn(
+        (1, *latent_shape), generator=generator, device=device, dtype=torch.float32
+    )
+
     # cond 全零时（无 image_embeds 的回退场景）v_cond == v_uncond，
     # CFG 双前向等价于无引导却多付一倍开销，直接退化为单分支
     use_cfg = cond is not None and guidance_scale > 1.0 and bool(cond.abs().any())
-    cond_uncond = torch.zeros_like(cond) if use_cfg else None
+    cond_batch: Optional[Tensor] = cond
+    if use_cfg:
+        # 官方顺序：torch.cat([negative_image_embeds, image_embeds])
+        cond_batch = torch.cat([torch.zeros_like(cond), cond], dim=0)
+
     for step in range(num_steps):
-        t = torch.full((1,), 1.0 - step * dt, device=device)
+        sigma = sigmas[step]
+        sigma_next = sigmas[step + 1]
+        latent_input = torch.cat([x, x], dim=0) if use_cfg else x
+        t = (sigma * timestep_scale).expand(latent_input.shape[0])
+
+        ctx = (
+            torch.cuda.amp.autocast(dtype=torch.bfloat16)
+            if use_bf16 and device.type == "cuda"
+            else torch.autocast("cpu", enabled=False)
+        )
+        with ctx:
+            velocity = forward_dit(dit, latent_input, t, cond_batch)
+
+        velocity = velocity.float()
         if use_cfg:
-            v_cond = forward_dit(dit, x, t * timestep_scale, cond)
-            v_uncond = forward_dit(dit, x, t * timestep_scale, cond_uncond)
+            v_uncond, v_cond = velocity.chunk(2)
             velocity = v_uncond + guidance_scale * (v_cond - v_uncond)
-        else:
-            velocity = forward_dit(dit, x, t * timestep_scale, cond)
-        x = x - dt * velocity
+        # 官方 step 的积分方向（sigma - sigma_next > 0）
+        x = x + (sigma - sigma_next) * velocity
+
     return x.squeeze(0)
 
 
@@ -1238,6 +1399,13 @@ def run_evaluation(
 ) -> Optional[Dict[str, float]]:
     """定期评估：EMA 权重采样 latent -> 解码 mesh -> 渲染预览图 + 附加指标。
 
+    采样走 ``sample_latent_flow``：与推理侧 ``TripoSGPipeline`` 同款的
+    rectified-flow 调度（sigma 网格 + 官方积分方向 + 批量 CFG），步数取
+    ``training.eval_num_steps``（默认 50），guidance 取 ``EVAL_GUIDANCE_SCALE``
+    （7.0）；eval 不做 condition dropout，固定初始噪声种子使各轮分数可比。
+    每个样本只采一个候选（不做推理侧的多候选 rerank），目标是给
+    BestCheckpointer 一个有区分度的分数。
+
     渲染参数（image_size / num_views / camera_distance / elevation_range）全部
     从配置 ``rendering`` 段读取，缺失时回落原有默认值。预览图之外，在对应
     模块可用时额外写入两个指标：
@@ -1257,6 +1425,15 @@ def run_evaluation(
     eval_dir = os.path.join(output_dir, "eval")
     train_cfg = config.get("training", {})
     timestep_scale = float(train_cfg.get("timestep_scale", 1000.0))
+    use_bf16 = bool(train_cfg.get("use_bf16", False))
+    # 采样步数与 sigma schedule 全部对齐推理侧；配置非法时告警回落默认，
+    # 绝不因一个观测参数中断训练（main 启动时已做过一次严格校验）
+    try:
+        eval_num_steps = parse_eval_num_steps(train_cfg)
+    except (TypeError, ValueError) as exc:
+        LOGGER.warning("[评估] eval_num_steps 配置非法（%s），回落 %d", exc, EVAL_NUM_STEPS)
+        eval_num_steps = EVAL_NUM_STEPS
+    flow_shift = resolve_flow_shift(config)
 
     try:
         from utils.visualize import save_image, tile_images
@@ -1310,14 +1487,22 @@ def run_evaluation(
         critic_scores: List[float] = []
         for i in range(EVAL_NUM_SAMPLES):
             try:
-                latent = sample_latent_euler(
+                # 固定噪声：同一个 i 在任意迭代拿到同一批初始噪声，分数差异
+                # 只来自权重（也不再扰动训练侧的全局 RNG 流）
+                noise_generator = torch.Generator(device=device).manual_seed(
+                    EVAL_NOISE_SEED + i
+                )
+                latent = sample_latent_flow(
                     dit,
                     latent_shape,
                     device,
-                    EVAL_NUM_STEPS,
+                    eval_num_steps,
                     timestep_scale,
                     conds[i % len(conds)],
                     guidance_scale=EVAL_GUIDANCE_SCALE,
+                    shift=flow_shift,
+                    use_bf16=use_bf16,
+                    generator=noise_generator,
                 )
                 vertices, faces = decode_latent_to_mesh(vae, latent)
                 verts = vertices.unsqueeze(0).to(device)
@@ -1512,6 +1697,9 @@ def main() -> None:
     # uncond 零嵌入分支留在分布内；0.0 = 不启用，训练行为与原来完全一致。
     # 区间校验（含 NaN）在 parse_condition_dropout 内完成
     condition_dropout = parse_condition_dropout(train_cfg)
+    # 训练内 eval 的采样步数（默认 50，与推理侧一致）；这里提前校验，
+    # 坏配置在启动时就报错，而不是跑到第一次 eval 才发现
+    eval_num_steps = parse_eval_num_steps(train_cfg)
 
     # 附加评估配置（旧配置缺失 evaluation 段时全部回落默认值；
     # num_val_samples 默认 0 = 不切验证集，训练行为与原来完全一致）
@@ -1525,6 +1713,11 @@ def main() -> None:
     LOGGER.info(
         "condition_dropout=%s",
         condition_dropout if condition_dropout > 0.0 else "0.0（未启用）",
+    )
+    LOGGER.info(
+        "训练内 eval 采样：%d 步 rectified-flow（推理同款调度），cfg_scale=%.1f",
+        eval_num_steps,
+        EVAL_GUIDANCE_SCALE,
     )
 
     # ---- 模型 / 优化器 / 调度器 ----
